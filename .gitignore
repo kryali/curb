@@ -24,3 +24,4 @@ coverage_c/
 coverage/
 
 ext/curb_core.bundle.dSYM/
+tests/server_lock-*
