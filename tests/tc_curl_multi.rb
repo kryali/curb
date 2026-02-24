@@ -682,17 +682,18 @@ class TestCurbCurlMulti < Test::Unit::TestCase
     max_iterations = 10_000
     iterations = 0
     loop do
-      still_running = m.perform_step
+      still_running, timeout_ms = m.perform_step
       iterations += 1
       break if still_running == 0
       raise "perform_step did not converge after #{max_iterations} iterations" if iterations >= max_iterations
       read_fds, write_fds, exc_fds, _maxfd = m.fdset
       unless read_fds.empty? && write_fds.empty? && exc_fds.empty?
+        timeout_sec = timeout_ms < 0 ? 0.1 : timeout_ms / 1000.0
         IO.select(
           read_fds.map  { |fd| IO.new(fd, autoclose: false) },
           write_fds.map { |fd| IO.new(fd, autoclose: false) },
           exc_fds.map   { |fd| IO.new(fd, autoclose: false) },
-          0.1
+          timeout_sec
         )
       end
     end
