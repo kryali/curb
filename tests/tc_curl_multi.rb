@@ -667,6 +667,18 @@ class TestCurbCurlMulti < Test::Unit::TestCase
     assert Curl::Err::MultiBadEasyHandle == e.class || Curl::Err::MultiAddedAlready == e.class
   end
 
+  def test_fdset_idle
+    m = Curl::Multi.new
+    read_fds, write_fds, exc_fds, maxfd = m.fdset
+    assert_instance_of Array, read_fds
+    assert_instance_of Array, write_fds
+    assert_instance_of Array, exc_fds
+    assert_equal [], read_fds
+    assert_equal [], write_fds
+    assert_equal [], exc_fds
+    assert_equal(-1, maxfd)
+  end
+
   def test_multi_default_timeout
     assert_equal 100, Curl::Multi.default_timeout
     Curl::Multi.default_timeout = 12

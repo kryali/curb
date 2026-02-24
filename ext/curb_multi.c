@@ -1279,6 +1279,67 @@ VALUE ruby_curl_multi_perform(int argc, VALUE *argv, VALUE self) {
   return Qtrue;
 }
 
+/* Helper: convert a C fd_set to a Ruby Array of integer file descriptors. */
+static VALUE fdset_to_ruby_array(fd_set *fds, int maxfd) {
+  VALUE ary = rb_ary_new();
+  int fd;
+  for (fd = 0; fd <= maxfd; fd++) {
+    if (FD_ISSET(fd, fds)) {
+      rb_ary_push(ary, INT2FIX(fd));
+    }
+  }
+  return ary;
+}
+
+/*
+ * call-seq:
+ *   multi.fdset  =>  [read_fds, write_fds, exc_fds, maxfd]
+ *
+ * Returns the file descriptor sets used by libcurl's multi handle as a
+ * four-element Array: three Arrays of integer file descriptors (read, write,
+ * and exception) followed by the maximum file descriptor as an Integer.
+ *
+ * When no transfers are active all three Arrays will be empty and maxfd
+ * will be -1.  This is useful for integrating curb with external event
+ * loops via IO.select.
+ *
+ * The returned file descriptors are owned by libcurl — do not close them.
+ * IO.select requires IO objects rather than integers, so wrap each array
+ * with IO.new(fd, autoclose: false). The autoclose: false is required to
+ * prevent Ruby from closing libcurl's sockets when the objects are garbage
+ * collected. Discard the IO objects after each select call — the fds are
+ * only valid for the current iteration and libcurl may close or reuse them
+ * as transfers complete:
+ *
+ *   read_fds, write_fds, exc_fds, maxfd = multi.fdset
+ *   to_io = ->(fds) { fds.map { |fd| IO.new(fd, autoclose: false) } }
+ *   IO.select(to_io[read_fds], to_io[write_fds], to_io[exc_fds], timeout)
+ */
+static VALUE ruby_curl_multi_fdset(VALUE self) {
+  CURLMcode mcode;
+  ruby_curl_multi *rbcm;
+  fd_set fdread, fdwrite, fdexcep;
+  int maxfd;
+
+  Data_Get_Struct(self, ruby_curl_multi, rbcm);
+
+  FD_ZERO(&fdread);
+  FD_ZERO(&fdwrite);
+  FD_ZERO(&fdexcep);
+
+  mcode = curl_multi_fdset(rbcm->handle, &fdread, &fdwrite, &fdexcep, &maxfd);
+  if (mcode != CURLM_OK) {
+    raise_curl_multi_error_exception(mcode);
+  }
+
+  VALUE result = rb_ary_new_capa(4);
+  rb_ary_push(result, fdset_to_ruby_array(&fdread, maxfd));
+  rb_ary_push(result, fdset_to_ruby_array(&fdwrite, maxfd));
+  rb_ary_push(result, fdset_to_ruby_array(&fdexcep, maxfd));
+  rb_ary_push(result, INT2FIX(maxfd));
+  return result;
+}
+
 /*
  * call-seq:
  *
@@ -1343,4 +1404,5 @@ void init_curb_multi() {
   rb_define_method(cCurlMulti, "perform", ruby_curl_multi_perform, -1);
 #endif
   rb_define_method(cCurlMulti, "_close", ruby_curl_multi_close, 0);
+  rb_define_method(cCurlMulti, "fdset", ruby_curl_multi_fdset, 0);
 }
