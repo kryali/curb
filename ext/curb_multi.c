@@ -1342,19 +1342,26 @@ static VALUE ruby_curl_multi_fdset(VALUE self) {
 
 /*
  * call-seq:
- *   multi.perform_step        => Integer
- *   multi.perform_step { |m| } => Integer
+ *   multi.perform_step        => [still_running, timeout_ms]
+ *   multi.perform_step { |m| } => [still_running, timeout_ms]
  *
  * Performs a single unit of I/O work across all active easy handles and
- * returns the number of still-running transfers. Unlike #perform, this
- * method does not loop — it returns immediately after one pass, allowing
- * the caller to drive the event loop (e.g. with IO.select + #fdset).
+ * returns a two-element array:
+ *   still_running — number of transfers still in progress
+ *   timeout_ms    — milliseconds the caller should wait before the next step,
+ *                   as recommended by libcurl via curl_multi_timeout().
+ *                   -1 means libcurl has no opinion; use your own default.
+ *
+ * Unlike #perform, this method does not loop — it returns immediately after
+ * one pass, allowing the caller to drive the event loop (e.g. with
+ * IO.select + #fdset).
  *
  * Raises Curl::Err::MultiError on libcurl failure.
  */
 static VALUE ruby_curl_multi_perform_step(int argc, VALUE *argv, VALUE self) {
   ruby_curl_multi *rbcm;
   VALUE block;
+  long timeout_ms = -1;
   rb_scan_args(argc, argv, "0&", &block);
   Data_Get_Struct(self, ruby_curl_multi, rbcm);
 
@@ -1363,7 +1370,8 @@ static VALUE ruby_curl_multi_perform_step(int argc, VALUE *argv, VALUE self) {
   if (block != Qnil) {
     rb_funcall(block, idCall, 1, self);
   }
-  return INT2FIX(rbcm->running);
+  curl_multi_timeout(rbcm->handle, &timeout_ms);
+  return rb_ary_new3(2, INT2FIX(rbcm->running), LONG2NUM(timeout_ms));
 }
 
 /*
