@@ -1342,6 +1342,32 @@ static VALUE ruby_curl_multi_fdset(VALUE self) {
 
 /*
  * call-seq:
+ *   multi.perform_step        => Integer
+ *   multi.perform_step { |m| } => Integer
+ *
+ * Performs a single unit of I/O work across all active easy handles and
+ * returns the number of still-running transfers. Unlike #perform, this
+ * method does not loop — it returns immediately after one pass, allowing
+ * the caller to drive the event loop (e.g. with IO.select + #fdset).
+ *
+ * Raises Curl::Err::MultiError on libcurl failure.
+ */
+static VALUE ruby_curl_multi_perform_step(int argc, VALUE *argv, VALUE self) {
+  ruby_curl_multi *rbcm;
+  VALUE block;
+  rb_scan_args(argc, argv, "0&", &block);
+  Data_Get_Struct(self, ruby_curl_multi, rbcm);
+
+  rb_curl_multi_run(self, rbcm->handle, &(rbcm->running));
+  rb_curl_multi_read_info(self, rbcm->handle);
+  if (block != Qnil) {
+    rb_funcall(block, idCall, 1, self);
+  }
+  return INT2FIX(rbcm->running);
+}
+
+/*
+ * call-seq:
  *
  * multi.close
  * after closing the multi handle all connections will be closed and the handle will no longer be usable
@@ -1405,4 +1431,5 @@ void init_curb_multi() {
 #endif
   rb_define_method(cCurlMulti, "_close", ruby_curl_multi_close, 0);
   rb_define_method(cCurlMulti, "fdset", ruby_curl_multi_fdset, 0);
+  rb_define_method(cCurlMulti, "perform_step", ruby_curl_multi_perform_step, -1);
 }
