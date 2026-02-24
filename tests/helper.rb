@@ -217,6 +217,14 @@ module TestServerMethods
 
   def server_setup(port=9129,servlet=TestServlet)
     @__port = port
+    # Treat the lock file as stale if nothing is actually listening on the port.
+    if File.exist?(locked_file)
+      begin
+        TCPSocket.new('127.0.0.1', port).close
+      rescue Errno::ECONNREFUSED, Errno::ETIMEDOUT
+        File.unlink(locked_file) rescue nil
+      end
+    end
     if (@server ||= nil).nil? and !File.exist?(locked_file)
       File.open(locked_file,'w') {|f| f << 'locked' }
       if TEST_SINGLE_THREADED
@@ -276,6 +284,7 @@ module TestServerMethods
       end
 
       trap("INT"){exit_code.call}
+      trap("TERM"){exit_code.call; exit}
       at_exit{exit_code.call}
 
     end

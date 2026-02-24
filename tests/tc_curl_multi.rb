@@ -667,6 +667,40 @@ class TestCurbCurlMulti < Test::Unit::TestCase
     assert Curl::Err::MultiBadEasyHandle == e.class || Curl::Err::MultiAddedAlready == e.class
   end
 
+  def test_perform_step
+    m = Curl::Multi.new
+    responses = []
+
+    2.times do
+      c = Curl::Easy.new(TestServlet.url)
+      c.on_complete { |e| responses << e.response_code }
+      m.add(c)
+    end
+
+    # Drive the event loop manually using perform_step.
+    # Loop until all handles finish (still_running == 0).
+    max_iterations = 10_000
+    iterations = 0
+    loop do
+      still_running = m.perform_step
+      iterations += 1
+      break if still_running == 0
+      raise "perform_step did not converge after #{max_iterations} iterations" if iterations >= max_iterations
+      read_fds, write_fds, exc_fds, _maxfd = m.fdset
+      unless read_fds.empty? && write_fds.empty? && exc_fds.empty?
+        IO.select(
+          read_fds.map  { |fd| IO.new(fd, autoclose: false) },
+          write_fds.map { |fd| IO.new(fd, autoclose: false) },
+          exc_fds.map   { |fd| IO.new(fd, autoclose: false) },
+          0.1
+        )
+      end
+    end
+
+    assert_equal 2, responses.size
+    assert responses.all? { |code| code == 200 }
+  end
+
   def test_fdset_idle
     m = Curl::Multi.new
     read_fds, write_fds, exc_fds, maxfd = m.fdset
