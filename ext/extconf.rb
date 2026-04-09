@@ -1,4 +1,14 @@
 require 'mkmf'
+
+# On macOS, static libcurl builds (e.g. curl-impersonate with BoringSSL/HTTP3)
+# require explicit linkage to system frameworks and the C++ runtime.
+# These flags are harmless for dynamic builds and ignored when not needed.
+if RUBY_PLATFORM =~ /darwin/
+  $LDFLAGS << " -framework CoreFoundation -framework SystemConfiguration" \
+              " -framework Foundation -framework Security -liconv -licucore"
+  $LIBS << " -lstdc++"
+end
+
 require 'tmpdir'
 begin
   require 'etc'
