@@ -1687,6 +1687,29 @@ static VALUE ruby_curl_easy_ssl_version_get(VALUE self) {
 
 /*
  * call-seq:
+ *   easy.http3_sig_hash_algs = "<string>"
+ *
+ * Set the TLS signature and hash algorithms for HTTP/3 (QUIC) connections.
+ * If set, overrides ssl_sig_hash_algs for QUIC connections.
+ * This is specific to curl-impersonate.
+ */
+static VALUE ruby_curl_easy_http3_sig_hash_algs_set(VALUE self, VALUE sig_algs) {
+  ruby_curl_easy *rbce;
+  Data_Get_Struct(self, ruby_curl_easy, rbce);
+#if HAVE_CURLOPT_HTTP3_SIG_HASH_ALGS
+  if (sig_algs == Qnil) {
+    curl_easy_setopt(rbce->curl, CURLOPT_HTTP3_SIG_HASH_ALGS, NULL);
+  } else {
+    curl_easy_setopt(rbce->curl, CURLOPT_HTTP3_SIG_HASH_ALGS, StringValueCStr(sig_algs));
+  }
+#else
+  rb_warn("CURLOPT_HTTP3_SIG_HASH_ALGS is not supported by the libcurl headers curb was compiled against.");
+#endif
+  return sig_algs;
+}
+
+/*
+ * call-seq:
  *   easy.use_ssl = value                             => fixnum or nil
  *
  * Ensure libcurl uses SSL for FTP connections. Valid options are Curl::CURL_USESSL_NONE,
@@ -4441,6 +4464,7 @@ void init_curb_easy() {
   rb_define_method(cCurlEasy, "header_size", ruby_curl_easy_header_size_get, 0);
   rb_define_method(cCurlEasy, "request_size", ruby_curl_easy_request_size_get, 0);
   rb_define_method(cCurlEasy, "ssl_verify_result", ruby_curl_easy_ssl_verify_result_get, 0);
+  rb_define_method(cCurlEasy, "http3_sig_hash_algs=", ruby_curl_easy_http3_sig_hash_algs_set, 1);
   rb_define_method(cCurlEasy, "downloaded_content_length", ruby_curl_easy_downloaded_content_length_get, 0);
   rb_define_method(cCurlEasy, "uploaded_content_length", ruby_curl_easy_uploaded_content_length_get, 0);
   rb_define_method(cCurlEasy, "content_type", ruby_curl_easy_content_type_get, 0);
