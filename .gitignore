@@ -7,6 +7,7 @@ ext/curb_errors.o
 ext/curb_multi.o
 ext/curb_postfield.o
 ext/curb_upload.o
+ext/curb_share.o
 ext/curb_config.h
 
 pkg/
