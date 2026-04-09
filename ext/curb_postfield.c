@@ -32,7 +32,7 @@ void append_to_form(VALUE self,
   ruby_curl_postfield *rbcpf;
   CURLFORMcode result = -1;
   
-  Data_Get_Struct(self, ruby_curl_postfield, rbcpf);
+  TypedData_Get_Struct(self, ruby_curl_postfield, &ruby_curl_postfield_data_type, rbcpf);
   
   if (rbcpf->name == Qnil) {
     rb_raise(eCurlErrInvalidPostField, "Cannot post unnamed field");
@@ -177,18 +177,42 @@ void append_to_form(VALUE self,
 
 
 /* ================== MARK/FREE FUNC ==================*/
-void curl_postfield_mark(ruby_curl_postfield *rbcpf) {
-  rb_gc_mark(rbcpf->name);
-  rb_gc_mark(rbcpf->content);
-  rb_gc_mark(rbcpf->content_type);
-  rb_gc_mark(rbcpf->local_file);
-  rb_gc_mark(rbcpf->remote_file);
-  rb_gc_mark(rbcpf->buffer_str);
+static void curl_postfield_mark(void *ptr) {
+  ruby_curl_postfield *rbcpf = (ruby_curl_postfield *)ptr;
+  if (rbcpf) {
+    rb_gc_mark(rbcpf->name);
+    rb_gc_mark(rbcpf->content);
+    rb_gc_mark(rbcpf->content_type);
+    rb_gc_mark(rbcpf->local_file);
+    rb_gc_mark(rbcpf->remote_file);
+    rb_gc_mark(rbcpf->buffer_str);
+  }
 }
 
-void curl_postfield_free(ruby_curl_postfield *rbcpf) {
-  free(rbcpf);
+static void curl_postfield_free(void *ptr) {
+  if (ptr) free(ptr);
 }
+
+static size_t curl_postfield_memsize(const void *ptr) {
+  (void)ptr;
+  return sizeof(ruby_curl_postfield);
+}
+
+const rb_data_type_t ruby_curl_postfield_data_type = {
+  "Curl::PostField",
+  {
+    curl_postfield_mark,
+    curl_postfield_free,
+    curl_postfield_memsize,
+#ifdef RUBY_TYPED_FREE_IMMEDIATELY
+    NULL, /* compact */
+#endif
+  },
+#ifdef RUBY_TYPED_FREE_IMMEDIATELY
+  NULL, NULL, /* parent, data */
+  RUBY_TYPED_FREE_IMMEDIATELY
+#endif
+};
 
 
 /* ================= ALLOC METHODS ====================*/
@@ -208,10 +232,11 @@ void curl_postfield_free(ruby_curl_postfield *rbcpf) {
  * data.
  */
 static VALUE ruby_curl_postfield_new_content(int argc, VALUE *argv, VALUE klass) {
-  ruby_curl_postfield *rbcpf = ALLOC(ruby_curl_postfield);
-  if (!rbcpf) {
-    rb_raise(rb_eNoMemError, "Failed to allocate memory for Curl::PostField");
-  }
+  VALUE self;
+  ruby_curl_postfield *rbcpf;
+
+  self = TypedData_Make_Struct(klass, ruby_curl_postfield, &ruby_curl_postfield_data_type, rbcpf);
+  MEMZERO(rbcpf, ruby_curl_postfield, 1);
  
   // wierdness - we actually require two args, unless a block is provided, but
   // we have to work that out below.
@@ -239,7 +264,7 @@ static VALUE ruby_curl_postfield_new_content(int argc, VALUE *argv, VALUE klass)
   rbcpf->remote_file = Qnil;
   rbcpf->buffer_str = Qnil;
  
-  return Data_Wrap_Struct(cCurlPostField, curl_postfield_mark, curl_postfield_free, rbcpf);
+  return self;
 }
 
 /*
@@ -257,10 +282,11 @@ static VALUE ruby_curl_postfield_new_content(int argc, VALUE *argv, VALUE klass)
  */
 static VALUE ruby_curl_postfield_new_file(int argc, VALUE *argv, VALUE klass) {
   // TODO needs to handle content-type too
-  ruby_curl_postfield *rbcpf = ALLOC(ruby_curl_postfield);
-  if (!rbcpf) {
-    rb_raise(rb_eNoMemError, "Failed to allocate memory for Curl::PostField");
-  }
+  VALUE self;
+  ruby_curl_postfield *rbcpf;
+
+  self = TypedData_Make_Struct(klass, ruby_curl_postfield, &ruby_curl_postfield_data_type, rbcpf);
+  MEMZERO(rbcpf, ruby_curl_postfield, 1);
 
   rb_scan_args(argc, argv, "21&", &rbcpf->name, &rbcpf->local_file, &rbcpf->remote_file, &rbcpf->content_proc);
 
@@ -288,7 +314,7 @@ static VALUE ruby_curl_postfield_new_file(int argc, VALUE *argv, VALUE klass) {
   rbcpf->content_type = Qnil;
   rbcpf->buffer_str = Qnil;
  
-  return Data_Wrap_Struct(cCurlPostField, curl_postfield_mark, curl_postfield_free, rbcpf);
+  return self;
 }
 
 /* ================= ATTRIBUTES ====================*/
@@ -435,7 +461,7 @@ static VALUE ruby_curl_postfield_to_str(VALUE self) {
   CURL *curl_handle = NULL;
 #endif
 
-  Data_Get_Struct(self, ruby_curl_postfield, rbcpf);
+  TypedData_Get_Struct(self, ruby_curl_postfield, &ruby_curl_postfield_data_type, rbcpf);
 
   if (rbcpf->name != Qnil) {
     name = rbcpf->name;

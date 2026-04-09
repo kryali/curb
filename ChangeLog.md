@@ -1,6 +1,25 @@
 # ChangeLog
+## 1.3.1
+* Fix Ruby 4.x compatibility in `Curl::Multi`
+
+## 1.3.0
+### Breaking Changes
+* `Curl::Multi#close` now permanently closes the multi handle. Code that previously called `close` and then reused the same `Curl::Multi` instance must now allocate a new multi handle instead. `Curl::Multi.autoclose` continues to use the internal reusable cleanup path for implicit autoclose and fiber-scheduler reuse.
+* Callback exceptions raised during `Multi#perform` and scheduler-driven `Easy#perform` are now deferred until in-flight sibling transfers finish draining, and queued replacement work is no longer started once a deferred callback exception is pending. Applications that relied on immediate aborts or that enqueue new work from completion callbacks after a sibling failure may observe different control flow.
+* `post_body=` and raw `CURLOPT_POSTFIELDS` assignments now snapshot the assigned Ruby string instead of aliasing later mutations to the caller's buffer. In addition, `easy.setopt(Curl::CURLOPT_POSTFIELDS, nil)` now clears the request body without implicitly switching the request back to GET; callers that relied on the old method-reset behavior must now set the method explicitly.
+* `close` and `reset` are now blocked while progress, debug, and upload-read callbacks are active, matching the existing restriction for body and header callbacks. Code that performed cleanup directly inside those callbacks must move that work outside the callback.
+
+### Changes
+* Improve Ruby 4.x and newer libcurl compatibility by addressing typed-data conversion and deprecation issues in the extension build.
+* Fix `post_body`, `CURLOPT_POSTFIELDS`, multipart form reuse, and `resolve` cleanup so request buffers and per-request native state stay valid across setup, mutation, and reset.
+* Tighten `Curl::Easy` and `Curl::Multi` lifecycle cleanup to reduce leaks and stale handle references, including explicit clearing of idle `easy.multi` back-references when a multi is closed.
+* Rework deferred callback exception handling for `Easy` and `Multi` so callback failures are re-raised on the originating request after sibling work drains, queued replacement work does not start once a deferred exception is pending, and deferred implicit-multi cleanup stays thread-affine.
+* Preserve the original callback exception for frozen `Curl::Easy` handles instead of raising `FrozenError`.
+* Improve Fiber scheduler integration so scheduler-driven `Easy#perform` reuses the shared multi correctly, keeps yielding timers/perform blocks while deferred completions drain, and wakes the originating waiter when deferred callback errors surface.
+* Add leak-trace tooling plus broader regression coverage for cleanup, callback, scheduler, GC.compact, and test-server stale-lock edge cases; CI now runs the valgrind suite on Linux Ruby 4.0.
 
 ## 1.2.2
+* Add `Curl::Easy#http_version` getter/setter along with HTTP/2 TLS/prior-knowledge constants so clients can force a specific HTTP protocol.
 * Fix rare `Multi#perform` segfault with GC.compact by recovering the Easy when `CURLINFO_PRIVATE` is stale and pruning unknown handles.
 * Store `ruby_curl_easy*` in `CURLOPT_PRIVATE` and use it for all libcurl callbacks (write/header/progress/debug) so GC.compact can’t invalidate stored VALUE pointers.
 * Pass `ruby_curl_easy` as libcurl userdata for default body/header handlers so GC.compact can’t invalidate stored VALUE pointers.

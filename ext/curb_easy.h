@@ -43,6 +43,7 @@ typedef struct {
   VALUE opts; /* rather then allocate everything we might need to store, allocate a Hash and only store objects we actually use... */
   VALUE multi; /* keep a multi handle alive for each easy handle not being used by a multi handle.  This improves easy performance when not within a multi context */
   VALUE share; /* Curl::Share reference — kept here so GC marks it alive while this easy handle is attached */
+  VALUE callback_error; /* preserves body/header callback exceptions without mutating the Ruby object */
 
   /* Other opts */
   unsigned short local_port;       // 0 is no port
@@ -65,6 +66,7 @@ typedef struct {
   long ssl_version;
   long use_ssl;
   long ftp_filemethod;
+  long http_version;
   unsigned short resolve_mode;
 
   /* bool flags */
@@ -88,14 +90,17 @@ typedef struct {
   struct curl_slist *curl_ftp_commands;
   struct curl_slist *curl_resolve;
 
+  unsigned long multi_attachment_generation;
   int last_result; /* last result code from multi loop */
 
 } ruby_curl_easy;
 
 extern VALUE cCurlEasy;
+extern const rb_data_type_t ruby_curl_easy_data_type;
 
 VALUE ruby_curl_easy_setup(ruby_curl_easy *rbce);
 VALUE ruby_curl_easy_cleanup(VALUE self, ruby_curl_easy *rbce);
+VALUE rb_curl_easy_take_callback_error(ruby_curl_easy *rbce);
 
 void init_curb_easy();
 

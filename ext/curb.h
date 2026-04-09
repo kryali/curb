@@ -29,11 +29,11 @@
 #include "curb_share.h"
 
 // These should be managed from the Rake 'release' task.
-#define CURB_VERSION   "1.2.2"
-#define CURB_VER_NUM   1022
+#define CURB_VERSION   "1.3.1"
+#define CURB_VER_NUM   1031
 #define CURB_VER_MAJ   1
-#define CURB_VER_MIN   2
-#define CURB_VER_MIC   2
+#define CURB_VER_MIN   3
+#define CURB_VER_MIC   1
 #define CURB_VER_PATCH 0
 
 
