@@ -1772,7 +1772,7 @@ static VALUE ruby_curl_multi_fdset(VALUE self) {
   fd_set fdread, fdwrite, fdexcep;
   int maxfd;
 
-  Data_Get_Struct(self, ruby_curl_multi, rbcm);
+  TypedData_Get_Struct(self, ruby_curl_multi, &ruby_curl_multi_data_type, rbcm);
 
   FD_ZERO(&fdread);
   FD_ZERO(&fdwrite);
@@ -1814,7 +1814,7 @@ static VALUE ruby_curl_multi_perform_step(int argc, VALUE *argv, VALUE self) {
   VALUE block;
   long timeout_ms = -1;
   rb_scan_args(argc, argv, "0&", &block);
-  Data_Get_Struct(self, ruby_curl_multi, rbcm);
+  TypedData_Get_Struct(self, ruby_curl_multi, &ruby_curl_multi_data_type, rbcm);
 
   rb_curl_multi_run(self, rbcm->handle, &(rbcm->running));
   rb_curl_multi_read_info(self, rbcm->handle);

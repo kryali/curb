@@ -4645,7 +4645,7 @@ static VALUE rb_easy_set_share(VALUE self, VALUE share) {
   ruby_curl_easy *rbce;
   ruby_curl_share *rshare;
 
-  Data_Get_Struct(self, ruby_curl_easy, rbce);
+  TypedData_Get_Struct(self, ruby_curl_easy, &ruby_curl_easy_data_type, rbce);
 
   if (NIL_P(share)) {
     curl_easy_setopt(rbce->curl, CURLOPT_SHARE, NULL);
