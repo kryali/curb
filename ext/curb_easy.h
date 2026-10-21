@@ -93,6 +93,7 @@ typedef struct {
   char unrestricted_auth;
   char verbose;
   char multipart_form_post;
+  char multipart_form_active; /* Temporary CURLOPT_HTTPPOST owned by perform. */
   char enable_cookies;
   char cookielist_engine_enabled; /* track if CURLOPT_COOKIELIST was used with a non-command to enable engine */
   char ignore_content_length;

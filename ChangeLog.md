@@ -1,4 +1,7 @@
 # ChangeLog
+## 1.4.1 (unreleased)
+* Fix a use-after-free when `Curl::Easy#clone` or `#dup` is called from a callback during a multipart request: detach the temporary form from the clone before the original request frees it, and reset the clone's callback state. Supply new `PostField` objects to send a multipart request with the clone. Add regression coverage for body, header, progress, debug, and completion callbacks.
+
 ## 1.4.0
 * Fix crashes when a user-supplied value's `#to_s` returns a non-String (e.g. a Fixnum): `Curl::PostField#to_s` (name and content coercion), `Curl::Easy#http_auth_types=`, and `Curl::Easy#escape` now use `rb_obj_as_string` instead of trusting a raw `#to_s` result, and `Curl::Easy#unescape` coerces its argument before use. Previously these passed the unchecked result straight to raw C string macros (`RSTRING_PTR`/`RSTRING_LEN`), which could segfault instead of raising.
 * Fix `Curl::Easy#http_auth_types = [:basic, :digest]` (the documented array form), which previously stringified the whole Array and set no auth types.

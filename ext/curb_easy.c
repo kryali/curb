@@ -1451,6 +1451,7 @@ static void ruby_curl_easy_zero(ruby_curl_easy *rbce) {
   rbce->unrestricted_auth = 0;
   rbce->verbose = 0;
   rbce->multipart_form_post = 0;
+  rbce->multipart_form_active = 0;
   rbce->enable_cookies = 0;
   rbce->cookielist_engine_enabled = 0;
   rbce->ignore_content_length = 0;
@@ -1571,6 +1572,8 @@ static VALUE duplicate_upload(VALUE upload) {
  *
  * Clone this Curl::Easy instance, creating a new instance.
  * This method duplicates the underlying CURL* handle.
+ * A temporary multipart form attached during a request is not copied;
+ * supply new PostFields to send a multipart request with the clone.
  */
 static VALUE ruby_curl_easy_clone(VALUE self) {
   ruby_curl_easy *rbce, *newrbce;
@@ -1590,6 +1593,18 @@ static VALUE ruby_curl_easy_clone(VALUE self) {
     free(newrbce);
     rb_raise(rb_eNoMemError, "Failed to duplicate Curl::Easy handle");
   }
+  /* duphandle borrows HTTPPOST, whose form is freed when the original
+   * perform unwinds. Only reset it when attached: setting HTTPPOST also
+   * changes request options and must not affect ordinary POST/upload clones. */
+  if (newrbce->multipart_form_active) {
+    CURLcode ecode = curl_easy_setopt(newrbce->curl, CURLOPT_HTTPPOST, NULL);
+    if (ecode != CURLE_OK) {
+      curl_easy_cleanup(newrbce->curl);
+      free(newrbce);
+      raise_curl_easy_error_exception(ecode);
+    }
+    newrbce->multipart_form_active = 0;
+  }
   newrbce->curl_headers = (rbce->curl_headers) ? duplicate_curl_slist(rbce->curl_headers) : NULL;
   newrbce->curl_proxy_headers = (rbce->curl_proxy_headers) ? duplicate_curl_slist(rbce->curl_proxy_headers) : NULL;
   newrbce->curl_ftp_commands = (rbce->curl_ftp_commands) ? duplicate_curl_slist(rbce->curl_ftp_commands) : NULL;
@@ -1603,6 +1618,7 @@ static VALUE ruby_curl_easy_clone(VALUE self) {
   /* A cloned easy should not retain ownership reference to the original multi. */
   newrbce->multi = Qnil;
   newrbce->callback_error = Qnil;
+  newrbce->callback_active = 0;
   newrbce->unsafe_destination_blocked = 0;
   memset(newrbce->unsafe_destination_error, 0, CURL_ERROR_SIZE);
   newrbce->native_active = 0;
@@ -4579,6 +4595,9 @@ static void append_multipart_form_argument(VALUE arg,
 static VALUE build_and_perform_multipart_form(VALUE argp) {
   struct easy_form_perform_args *args = (struct easy_form_perform_args *)argp;
   int i;
+  ruby_curl_easy *rbce;
+
+  TypedData_Get_Struct(args->self, ruby_curl_easy, &ruby_curl_easy_data_type, rbce);
 
   for (i = 0; i < args->argc; i++) {
     append_multipart_form_argument(args->argv[i], &args->first, &args->last);
@@ -4587,6 +4606,7 @@ static VALUE build_and_perform_multipart_form(VALUE argp) {
   curl_easy_setopt(args->curl, CURLOPT_POST, 0);
   curl_easy_setopt(args->curl, CURLOPT_HTTPPOST, args->first);
   args->form_set_on_curl = 1;
+  rbce->multipart_form_active = 1;
 
   return call_easy_perform(args->self);
 }
@@ -4595,7 +4615,10 @@ static VALUE ensure_free_form_post(VALUE argp) {
   struct easy_form_perform_args *args = (struct easy_form_perform_args *)argp;
   if (args->curl) {
     if (args->form_set_on_curl) {
+      ruby_curl_easy *rbce;
+      TypedData_Get_Struct(args->self, ruby_curl_easy, &ruby_curl_easy_data_type, rbce);
       curl_easy_setopt(args->curl, CURLOPT_HTTPPOST, NULL);
+      rbce->multipart_form_active = 0;
     }
     if (args->clear_customrequest) {
       curl_easy_setopt(args->curl, CURLOPT_CUSTOMREQUEST, NULL);
