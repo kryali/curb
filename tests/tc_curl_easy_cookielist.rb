@@ -186,13 +186,15 @@ class TestCurbCurlEasyCookielist < Test::Unit::TestCase
       cookiefile = File.join(Dir.tmpdir, 'curl_test_cookiefile')
       assert !File.exist?(cookiefile)
       begin
+        # Use host-only file cookies: libpsl builds normalize localhost domain
+        # cookies on file load, but COOKIELIST imports retain tail matching.
         cookielist = [
           # Won't be updated, added instead
-          ".localhost\tTRUE\t/\tFALSE\t#{expires_file.to_time.to_i}\tpermanent\t84",
-          ".localhost\tTRUE\t/\tFALSE\t#{expires_file.to_time.to_i}\tpermanent_file\t84",
+          "localhost\tFALSE\t/\tFALSE\t#{expires_file.to_time.to_i}\tpermanent\t84",
+          "localhost\tFALSE\t/\tFALSE\t#{expires_file.to_time.to_i}\tpermanent_file\t84",
           # Won't be updated, added instead
-          ".localhost\tTRUE\t/\tFALSE\t0\tsession\t840",
-          ".localhost\tTRUE\t/\tFALSE\t0\tsession_file\t840",
+          "localhost\tFALSE\t/\tFALSE\t0\tsession\t840",
+          "localhost\tFALSE\t/\tFALSE\t0\tsession_file\t840",
           '',
         ]
         File.write(cookiefile, cookielist.join("\n"))
@@ -204,10 +206,10 @@ class TestCurbCurlEasyCookielist < Test::Unit::TestCase
         expected_cookielist = [
           ".localhost\tTRUE\t/\tFALSE\t#{expires.to_time.to_i}\tpermanent\t42",
           ".localhost\tTRUE\t/\tFALSE\t0\tsession\t420",
-          ".localhost\tTRUE\t/\tFALSE\t#{expires_file.to_time.to_i}\tpermanent\t84",
-          ".localhost\tTRUE\t/\tFALSE\t#{expires_file.to_time.to_i}\tpermanent_file\t84",
-          ".localhost\tTRUE\t/\tFALSE\t0\tsession\t840",
-          ".localhost\tTRUE\t/\tFALSE\t0\tsession_file\t840",
+          "localhost\tFALSE\t/\tFALSE\t#{expires_file.to_time.to_i}\tpermanent\t84",
+          "localhost\tFALSE\t/\tFALSE\t#{expires_file.to_time.to_i}\tpermanent_file\t84",
+          "localhost\tFALSE\t/\tFALSE\t0\tsession\t840",
+          "localhost\tFALSE\t/\tFALSE\t0\tsession_file\t840",
         ]
         assert_equal expected_cookielist, easy.cookielist
         easy.perform

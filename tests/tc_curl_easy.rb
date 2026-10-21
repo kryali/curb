@@ -46,7 +46,9 @@ class TestCurbCurlEasy < Test::Unit::TestCase
     easy = Curl::Easy.allocate
     easy.send(:initialize, $TEST_URL)
     easy.perform
-    assert_equal $TEST_URL, easy.last_effective_url
+    # libcurl normalizes file:///C:/ to file://C:/ on Windows.
+    expected_url = WINDOWS ? $TEST_URL.sub(%r{\Afile:///}, "file://") : $TEST_URL
+    assert_equal expected_url, easy.last_effective_url
     assert_match(/^# DO NOT REMOVE THIS COMMENT/, easy.body_str)
   end
 

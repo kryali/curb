@@ -97,7 +97,10 @@ class TestCurbRactor < Test::Unit::TestCase
           later = Curl::PostField.content('later') do
             name.replace('changed' * 1000)
             payload.replace('changed' * 1000)
-            if iteration % 10 == 0
+            # Ruby #21537: explicit GC in a Windows Ractor can deadlock
+            # the VM barrier. Keep parallel mutation coverage on Windows;
+            # single-Ractor compaction is covered by the PostField tests.
+            if iteration % 10 == 0 && !WINDOWS
               GC.start
               GC.compact if GC.respond_to?(:compact)
             end
