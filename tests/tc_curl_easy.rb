@@ -79,6 +79,28 @@ class TestCurbCurlEasy < Test::Unit::TestCase
     multi.close if multi
   end
 
+  [:initialize, :close, :reset].each do |operation|
+    define_method("test_#{operation}_removes_multi_bookkeeping_before_readd") do
+      easy = Curl::Easy.new($TEST_URL)
+      multi = Curl::Multi.new
+      multi.add(easy)
+      easy.__send__(operation)
+
+      assert_nil easy.multi
+      assert_empty multi.requests
+      assert_empty multi.__send__(:__curb_native_safety_signatures)
+
+      easy.url = $TEST_URL
+      multi.add(easy)
+      assert_equal [easy], multi.requests.values
+      multi.perform
+      assert_match(/^# DO NOT REMOVE THIS COMMENT/, easy.body_str)
+    ensure
+      multi.close if multi
+      easy.close if easy
+    end
+  end
+
   def test_reinitialize_during_callback_is_blocked
     easy = Curl::Easy.new($TEST_URL)
     easy.on_body do |data|

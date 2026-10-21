@@ -454,9 +454,9 @@ module Curl
 
     def remove(easy)
       return self if !requests[easy.object_id]
+      _remove(easy)
       requests.delete(easy.object_id)
       __curb_native_safety_signatures.delete(easy.object_id)
-      _remove(easy)
       self
     end
 

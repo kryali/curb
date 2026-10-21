@@ -1303,6 +1303,19 @@ static ruby_curl_multi *ruby_curl_multi_pointer_if_compatible(VALUE multi_val) {
 #endif
 }
 
+/* Explicit lifecycle operations can update Ruby bookkeeping; the GC free
+ * path below must remain allocation-free. */
+static void ruby_curl_easy_detach(VALUE self, ruby_curl_easy *rbce) {
+  VALUE multi = rbce->multi;
+  ruby_curl_multi *rbcm = ruby_curl_multi_pointer_if_compatible(multi);
+  if (rbcm) {
+    CURLMcode result = rb_curl_multi_detach_easy(rbcm, rbce);
+    if (result != CURLM_OK) raise_curl_multi_error_exception(result);
+    rb_curl_multi_remove_request_reference(multi, self);
+  }
+  rbce->multi = Qnil;
+}
+
 static void ruby_curl_easy_free(ruby_curl_easy *rbce) {
   if (!rbce) {
     return;
@@ -1319,10 +1332,7 @@ static void ruby_curl_easy_free(ruby_curl_easy *rbce) {
        * libcurl retaining a dangling pointer to a soon-to-be cleaned-up easy
        * handle. This path runs during GC, so it must not invoke Ruby APIs that
        * can allocate or raise. */
-      if (rbcm->handle && rbce->curl) {
-        curl_multi_remove_handle(rbcm->handle, rbce->curl);
-      }
-      rb_curl_multi_forget_easy(rbcm, rbce);
+      rb_curl_multi_detach_easy(rbcm, rbce);
     }
   }
 
@@ -1396,6 +1406,20 @@ const rb_data_type_t ruby_curl_easy_data_type = {
 };
 
 
+void ruby_curl_easy_check_access(ruby_curl_easy *rbce) {
+  if (rbce->multipart_building) {
+    rb_raise(rb_eRuntimeError, "Cannot access an active curl handle during multipart construction");
+  }
+  rb_curl_multi_check_easy_thread(rbce);
+}
+
+static void ruby_curl_easy_check_idle(ruby_curl_easy *rbce) {
+  ruby_curl_easy_check_access(rbce);
+  if (rb_curl_multi_easy_performing(rbce)) {
+    rb_raise(rb_eRuntimeError, "Cannot modify an active curl handle during perform");
+  }
+}
+
 /* Public entry points must not pass an uninitialized handle to libcurl. */
 ruby_curl_easy *ruby_curl_easy_get_handle(VALUE self) {
   ruby_curl_easy *rbce;
@@ -1403,6 +1427,7 @@ ruby_curl_easy *ruby_curl_easy_get_handle(VALUE self) {
   if (!rbce->curl) {
     rb_raise(eCurlErrFailedInit, "Curl::Easy handle is not initialized");
   }
+  ruby_curl_easy_check_access(rbce);
   return rbce;
 }
 
@@ -1470,6 +1495,7 @@ static void ruby_curl_easy_zero(ruby_curl_easy *rbce) {
   rbce->verbose = 0;
   rbce->multipart_form_post = 0;
   rbce->multipart_form_active = 0;
+  rbce->multipart_building = 0;
   rbce->enable_cookies = 0;
   rbce->cookielist_engine_enabled = 0;
   rbce->ignore_content_length = 0;
@@ -1522,6 +1548,9 @@ static VALUE ruby_curl_easy_initialize(int argc, VALUE *argv, VALUE self) {
   if (rbce->callback_active || rbce->native_active) {
     rb_raise(rb_eRuntimeError, "Cannot initialize an active curl handle");
   }
+
+  ruby_curl_easy_check_idle(rbce);
+  ruby_curl_easy_detach(self, rbce);
 
   /* Detach and release any previous handle and its owned option lists. */
   ruby_curl_easy_free(rbce);
@@ -1699,6 +1728,9 @@ static VALUE ruby_curl_easy_close(VALUE self) {
     rb_raise(rb_eRuntimeError, "Cannot close an active curl handle during native operation");
   }
 
+  ruby_curl_easy_check_idle(rbce);
+  ruby_curl_easy_detach(self, rbce);
+
   ruby_curl_easy_free(rbce);
 
   /* reinit the handle */
@@ -1749,6 +1781,9 @@ static VALUE ruby_curl_easy_reset(VALUE self) {
   if (rbce->native_active) {
     rb_raise(rb_eRuntimeError, "Cannot reset an active curl handle during native operation");
   }
+
+  ruby_curl_easy_check_idle(rbce);
+  ruby_curl_easy_detach(self, rbce);
 
   opts_dup = rb_funcall(rbce->opts, rb_intern("dup"), 0);
 
@@ -4576,6 +4611,8 @@ struct easy_form_perform_args {
   struct curl_httppost *last;
   int clear_customrequest;
   int form_set_on_curl;
+  ruby_curl_form_string *strings;
+  ruby_curl_easy *rbce;
 };
 
 struct easy_join_args {
@@ -4597,15 +4634,16 @@ static VALUE join_easy_arguments(ruby_curl_easy *rbce, VALUE args_ary) {
 
 static void append_multipart_form_argument(VALUE arg,
                                            struct curl_httppost **first,
-                                           struct curl_httppost **last) {
+                                           struct curl_httppost **last,
+                                           ruby_curl_form_string **strings) {
   if (rb_obj_is_instance_of(arg, cCurlPostField)) {
-    append_to_form(arg, first, last);
+    append_to_form(arg, first, last, strings);
   } else if (rb_type(arg) == T_ARRAY) {
     long j, argv_len = RARRAY_LEN(arg);
     for (j = 0; j < argv_len; ++j) {
       VALUE field = rb_ary_entry(arg, j);
       if (rb_obj_is_instance_of(field, cCurlPostField)) {
-        append_to_form(field, first, last);
+        append_to_form(field, first, last, strings);
       } else {
         rb_raise(eCurlErrInvalidPostField,
                  "You must use PostFields only with multipart form posts");
@@ -4623,9 +4661,12 @@ static VALUE build_and_perform_multipart_form(VALUE argp) {
   ruby_curl_easy *rbce;
 
   rbce = ruby_curl_easy_get_handle(args->self);
+  args->rbce = rbce;
+  ruby_curl_easy_enter_native(rbce);
+  rbce->multipart_building = 1;
 
   for (i = 0; i < args->argc; i++) {
-    append_multipart_form_argument(args->argv[i], &args->first, &args->last);
+    append_multipart_form_argument(args->argv[i], &args->first, &args->last, &args->strings);
   }
 
   curl_easy_setopt(args->curl, CURLOPT_POST, 0);
@@ -4633,11 +4674,13 @@ static VALUE build_and_perform_multipart_form(VALUE argp) {
   args->form_set_on_curl = 1;
   rbce->multipart_form_active = 1;
 
+  rbce->multipart_building = 0;
   return call_easy_perform(args->self);
 }
 
 static VALUE ensure_free_form_post(VALUE argp) {
   struct easy_form_perform_args *args = (struct easy_form_perform_args *)argp;
+  if (args->rbce) args->rbce->multipart_building = 0;
   if (args->curl) {
     if (args->form_set_on_curl) {
       ruby_curl_easy *rbce;
@@ -4654,6 +4697,9 @@ static VALUE ensure_free_form_post(VALUE argp) {
     args->first = NULL;
   }
   args->last = NULL;
+  free_form_strings(args->strings);
+  args->strings = NULL;
+  if (args->rbce) ruby_curl_easy_leave_native((VALUE)args->rbce);
   return Qnil;
 }
 
@@ -4697,7 +4743,7 @@ static VALUE ruby_curl_easy_perform_post(int argc, VALUE *argv, VALUE self) {
 
   if (rbce->multipart_form_post) {
     VALUE ret;
-    struct easy_form_perform_args perform_args = { self, curl, argc, argv, NULL, NULL, 0, 0 };
+    struct easy_form_perform_args perform_args = { self, curl, argc, argv, NULL, NULL, 0, 0, NULL, NULL };
     ret = rb_ensure(build_and_perform_multipart_form, (VALUE)&perform_args, ensure_free_form_post, (VALUE)&perform_args);
 
     return ret;
@@ -4758,7 +4804,7 @@ static VALUE ruby_curl_easy_perform_patch(int argc, VALUE *argv, VALUE self) {
 
   if (rbce->multipart_form_post) {
     VALUE ret;
-    struct easy_form_perform_args perform_args = { self, curl, argc, argv, NULL, NULL, 1, 0 };
+    struct easy_form_perform_args perform_args = { self, curl, argc, argv, NULL, NULL, 1, 0, NULL, NULL };
     ret = rb_ensure(build_and_perform_multipart_form, (VALUE)&perform_args, ensure_free_form_post, (VALUE)&perform_args);
     return ret;
   } else {
@@ -4816,7 +4862,7 @@ static VALUE ruby_curl_easy_perform_put(int argc, VALUE *argv, VALUE self) {
   /* Otherwise, if multipart_form_post is true, use multipart logic */
   else if (rbce->multipart_form_post) {
     VALUE ret;
-    struct easy_form_perform_args perform_args = { self, curl, argc, argv, NULL, NULL, 1, 0 };
+    struct easy_form_perform_args perform_args = { self, curl, argc, argv, NULL, NULL, 1, 0, NULL, NULL };
     ret = rb_ensure(build_and_perform_multipart_form, (VALUE)&perform_args, ensure_free_form_post, (VALUE)&perform_args);
     return ret;
   }
@@ -5681,6 +5727,7 @@ static VALUE ruby_curl_easy_set_opt(VALUE self, VALUE opt, VALUE val) {
   rb_io_t *open_f_ptr;
 
   rbce = ruby_curl_easy_get_handle(self);
+  ruby_curl_easy_check_idle(rbce);
 
   switch (option) {
   /* BEHAVIOR OPTIONS */
@@ -6132,6 +6179,28 @@ static VALUE ruby_curl_easy_inspect(VALUE self) {
 
 /* ================== ESCAPING FUNCS ==============*/
 
+struct curl_string_result {
+  char *data;
+  long length;
+};
+
+static VALUE curl_string_result_body(VALUE argp) {
+  struct curl_string_result *args = (struct curl_string_result *)argp;
+  return rb_str_new(args->data, args->length);
+}
+
+static VALUE curl_string_result_free(VALUE argp) {
+  struct curl_string_result *args = (struct curl_string_result *)argp;
+  curl_free(args->data);
+  return Qnil;
+}
+
+static VALUE curl_string_result_to_ruby(char *data, long length) {
+  struct curl_string_result args = { data, length };
+  return rb_ensure(curl_string_result_body, (VALUE)&args,
+                   curl_string_result_free, (VALUE)&args);
+}
+
 /*
  * call-seq:
  *   easy.escape("some text")                         => "some%20text"
@@ -6144,7 +6213,6 @@ static VALUE ruby_curl_easy_inspect(VALUE self) {
 static VALUE ruby_curl_easy_escape(VALUE self, VALUE svalue) {
   ruby_curl_easy *rbce;
   char *result;
-  VALUE rresult;
   VALUE str = svalue;
 
   rbce = ruby_curl_easy_get_handle(self);
@@ -6159,10 +6227,8 @@ static VALUE ruby_curl_easy_escape(VALUE self, VALUE svalue) {
   result = (char*)curl_escape(StringValuePtr(str), (int)RSTRING_LEN(str));
 #endif
 
-  rresult = rb_str_new2(result);
-  curl_free(result);
-
-  return rresult;
+  if (!result) rb_raise(eCurlErrError, "Failed to URL-encode string");
+  return curl_string_result_to_ruby(result, (long)strlen(result));
 }
 
 /*
@@ -6177,7 +6243,6 @@ static VALUE ruby_curl_easy_unescape(VALUE self, VALUE str) {
   ruby_curl_easy *rbce;
   int rlen;
   char *result;
-  VALUE rresult;
 
   rbce = ruby_curl_easy_get_handle(self);
 
@@ -6190,13 +6255,13 @@ static VALUE ruby_curl_easy_unescape(VALUE self, VALUE str) {
   result = (char*)curl_easy_unescape(rbce->curl, StringValuePtr(str), (int)RSTRING_LEN(str), &rlen);
 #else
   result = (char*)curl_unescape(StringValuePtr(str), (int)RSTRING_LEN(str));
-  rlen = strlen(result);
 #endif
 
-  rresult = rb_str_new(result, rlen);
-  curl_free(result);
-
-  return rresult;
+  if (!result) rb_raise(eCurlErrError, "Failed to URL-decode string");
+#if (LIBCURL_VERSION_NUM < 0x070f04)
+  rlen = (int)strlen(result);
+#endif
+  return curl_string_result_to_ruby(result, rlen);
 }
 
 

@@ -93,6 +93,7 @@ typedef struct {
   char unrestricted_auth;
   char verbose;
   char multipart_form_post;
+  char multipart_building; /* Disallow reentry while Ruby builds the form. */
   char multipart_form_active; /* Temporary CURLOPT_HTTPPOST owned by perform. */
   char enable_cookies;
   char cookielist_engine_enabled; /* track if CURLOPT_COOKIELIST was used with a non-command to enable engine */
@@ -126,6 +127,7 @@ extern VALUE cCurlEasy;
 extern const rb_data_type_t ruby_curl_easy_data_type;
 
 ruby_curl_easy *ruby_curl_easy_get_handle(VALUE self);
+void ruby_curl_easy_check_access(ruby_curl_easy *rbce);
 
 VALUE ruby_curl_easy_setup(ruby_curl_easy *rbce);
 VALUE ruby_curl_easy_cleanup(VALUE self, ruby_curl_easy *rbce);

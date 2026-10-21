@@ -20,134 +20,106 @@ VALUE cCurlPostField;
 
 /* ================= APPEND FORM FUNC ================ */
 
-/* This gets called by the post method on Curl::Easy for each postfield
- * supplied in the arguments. It's job is to add the supplied field to
- * the list that's being built for a perform.
- * 
- * THIS FUNC MODIFIES ITS ARGUMENTS. See curl_formadd(3) for details.
- */
-void append_to_form(VALUE self, 
-                    struct curl_httppost **first, 
-                    struct curl_httppost **last) {                               
+/* Keep private, immutable strings alive until the request frees its form.
+ * Snapshot each value before invoking any further user-defined coercions. */
+static VALUE form_string_snapshot(VALUE value, ruby_curl_form_string **strings) {
+  VALUE snapshot;
+  ruby_curl_form_string *entry;
+  StringValue(value);
+  snapshot = rb_str_new(RSTRING_PTR(value), RSTRING_LEN(value));
+  rb_obj_freeze(snapshot);
+  entry = ALLOC(ruby_curl_form_string);
+  entry->string = snapshot;
+  entry->next = *strings;
+  *strings = entry;
+  /* Register individually to pin embedded string buffers during compaction. */
+  rb_gc_register_address(&entry->string);
+  return snapshot;
+}
+
+void free_form_strings(ruby_curl_form_string *strings) {
+  while (strings) {
+    ruby_curl_form_string *next = strings->next;
+    rb_gc_unregister_address(&strings->string);
+    xfree(strings);
+    strings = next;
+  }
+}
+
+void append_to_form(VALUE self,
+                    struct curl_httppost **first,
+                    struct curl_httppost **last,
+                    ruby_curl_form_string **strings) {
   ruby_curl_postfield *rbcpf;
   CURLFORMcode result = -1;
-  
-  TypedData_Get_Struct(self, ruby_curl_postfield, &ruby_curl_postfield_data_type, rbcpf);
-  
-  if (rbcpf->name == Qnil) {
-    rb_raise(eCurlErrInvalidPostField, "Cannot post unnamed field");
-  } else {
-    if ((rbcpf->local_file != Qnil) || (rbcpf->remote_file != Qnil)) {
-      // is a file upload field
-      if (rbcpf->content_proc != Qnil) {
-        // with content proc
-        rbcpf->buffer_str = rb_funcall(rbcpf->content_proc, idCall, 1, self);
-        
-        if (rbcpf->remote_file == Qnil) {
-          rb_raise(eCurlErrInvalidPostField, "Cannot post file upload field with no filename");
-        } else {
-          /* Coerce before reading the pointer/length; keep the string GC-rooted. */
-          StringValue(rbcpf->buffer_str);
-          if (rbcpf->content_type == Qnil) {
-            result = curl_formadd(first, last, CURLFORM_PTRNAME, StringValuePtr(rbcpf->name), 
-                                               CURLFORM_BUFFER, StringValuePtr(rbcpf->remote_file),
-                                               CURLFORM_BUFFERPTR, RSTRING_PTR(rbcpf->buffer_str),
-                                               CURLFORM_BUFFERLENGTH, RSTRING_LEN(rbcpf->buffer_str),
-                                               CURLFORM_END);
-          } else {
-            result = curl_formadd(first, last, CURLFORM_PTRNAME, StringValuePtr(rbcpf->name), 
-                                               CURLFORM_BUFFER, StringValuePtr(rbcpf->remote_file),
-                                               CURLFORM_BUFFERPTR, RSTRING_PTR(rbcpf->buffer_str),
-                                               CURLFORM_BUFFERLENGTH, RSTRING_LEN(rbcpf->buffer_str),
-                                               CURLFORM_CONTENTTYPE, StringValuePtr(rbcpf->content_type),
-                                               CURLFORM_END);
-          }
-        }
-      } else if (rbcpf->content != Qnil) {
-        // with content
-        if (rbcpf->remote_file == Qnil) {
-          rb_raise(eCurlErrInvalidPostField, "Cannot post file upload field with no filename");
-        } else {
-          /* Coerce before reading the pointer/length; keep the string GC-rooted. */
-          StringValue(rbcpf->content);
-          if (rbcpf->content_type == Qnil) {
-            result = curl_formadd(first, last, CURLFORM_PTRNAME, StringValuePtr(rbcpf->name), 
-                                               CURLFORM_BUFFER, StringValuePtr(rbcpf->remote_file),
-                                               CURLFORM_BUFFERPTR, RSTRING_PTR(rbcpf->content),
-                                               CURLFORM_BUFFERLENGTH, RSTRING_LEN(rbcpf->content),
-                                               CURLFORM_END);
-          } else {
-            result = curl_formadd(first, last, CURLFORM_PTRNAME, StringValuePtr(rbcpf->name), 
-                                               CURLFORM_BUFFER, StringValuePtr(rbcpf->remote_file),
-                                               CURLFORM_BUFFERPTR, RSTRING_PTR(rbcpf->content),
-                                               CURLFORM_BUFFERLENGTH, RSTRING_LEN(rbcpf->content),
-                                               CURLFORM_CONTENTTYPE, StringValuePtr(rbcpf->content_type),
-                                               CURLFORM_END);
-          }
-        }
-      } else if (rbcpf->local_file != Qnil) {
-        // with local filename
-        if (rbcpf->local_file == Qnil) {
-          rb_raise(eCurlErrInvalidPostField, "Cannot post file upload field no filename");
-        } else {
-          if (rbcpf->remote_file == Qnil) {
-            rbcpf->remote_file = rbcpf->local_file;
-          }
-          
-          if (rbcpf->content_type == Qnil) {
-            result = curl_formadd(first, last, CURLFORM_PTRNAME, StringValuePtr(rbcpf->name), 
-                                               CURLFORM_FILE, StringValuePtr(rbcpf->local_file),
-                                               CURLFORM_FILENAME, StringValuePtr(rbcpf->remote_file),
-                                               CURLFORM_END);
-          } else {
-            result = curl_formadd(first, last, CURLFORM_PTRNAME, StringValuePtr(rbcpf->name), 
-                                               CURLFORM_FILE, StringValuePtr(rbcpf->local_file),
-                                               CURLFORM_FILENAME, StringValuePtr(rbcpf->remote_file),
-                                               CURLFORM_CONTENTTYPE, StringValuePtr(rbcpf->content_type),
-                                               CURLFORM_END);
-          }            
-        }
-      } else {
-        rb_raise(eCurlErrInvalidPostField, "Cannot post file upload field with no data");
-      }
-    } else {
-      // is a content field
-      if (rbcpf->content_proc != Qnil) {
-        rbcpf->buffer_str = rb_funcall(rbcpf->content_proc, idCall, 1, self);
-        StringValue(rbcpf->buffer_str);
+  VALUE name, content = Qnil, remote = Qnil, local = Qnil, type = Qnil;
+  int is_file;
+  struct curl_forms form[8];
+  int n = 0;
 
-        if (rbcpf->content_type == Qnil) {
-          result = curl_formadd(first, last, CURLFORM_PTRNAME, StringValuePtr(rbcpf->name), 
-                                             CURLFORM_PTRCONTENTS, RSTRING_PTR(rbcpf->buffer_str),
-                                             CURLFORM_CONTENTSLENGTH, RSTRING_LEN(rbcpf->buffer_str),
-                                             CURLFORM_END);
-        } else {
-          result = curl_formadd(first, last, CURLFORM_PTRNAME, StringValuePtr(rbcpf->name), 
-                                             CURLFORM_PTRCONTENTS, RSTRING_PTR(rbcpf->buffer_str),
-                                             CURLFORM_CONTENTSLENGTH, RSTRING_LEN(rbcpf->buffer_str),
-                                             CURLFORM_CONTENTTYPE, StringValuePtr(rbcpf->content_type),
-                                             CURLFORM_END);
-        }
-      } else if (rbcpf->content != Qnil) {
-        StringValue(rbcpf->content);
-        if (rbcpf->content_type == Qnil) {
-          result = curl_formadd(first, last, CURLFORM_PTRNAME, StringValuePtr(rbcpf->name), 
-                                             CURLFORM_PTRCONTENTS, RSTRING_PTR(rbcpf->content),
-                                             CURLFORM_CONTENTSLENGTH, RSTRING_LEN(rbcpf->content),
-                                             CURLFORM_END);
-        } else {
-          result = curl_formadd(first, last, CURLFORM_PTRNAME, StringValuePtr(rbcpf->name), 
-                                             CURLFORM_PTRCONTENTS, RSTRING_PTR(rbcpf->content),
-                                             CURLFORM_CONTENTSLENGTH, RSTRING_LEN(rbcpf->content),
-                                             CURLFORM_CONTENTTYPE, StringValuePtr(rbcpf->content_type),
-                                             CURLFORM_END);
-        }
-      } else {
-        rb_raise(eCurlErrInvalidPostField, "Cannot post content field with no data");
+  TypedData_Get_Struct(self, ruby_curl_postfield, &ruby_curl_postfield_data_type, rbcpf);
+  if (NIL_P(rbcpf->name)) {
+    rb_raise(eCurlErrInvalidPostField, "Cannot post unnamed field");
+  }
+  is_file = !NIL_P(rbcpf->local_file) || !NIL_P(rbcpf->remote_file);
+  if (!NIL_P(rbcpf->content_proc)) {
+    rbcpf->buffer_str = rb_funcall(rbcpf->content_proc, idCall, 1, self);
+    StringValue(rbcpf->buffer_str);
+    content = form_string_snapshot(rbcpf->buffer_str, strings);
+  } else if (!NIL_P(rbcpf->content)) {
+    StringValue(rbcpf->content);
+    content = form_string_snapshot(rbcpf->content, strings);
+  }
+
+  name = form_string_snapshot(rbcpf->name, strings);
+  if (is_file) {
+    if (!NIL_P(content)) {
+      if (NIL_P(rbcpf->remote_file)) {
+        rb_raise(eCurlErrInvalidPostField, "Cannot post file upload field with no filename");
       }
+    } else if (!NIL_P(rbcpf->local_file)) {
+      local = form_string_snapshot(rbcpf->local_file, strings);
+      if (NIL_P(rbcpf->remote_file)) rbcpf->remote_file = rbcpf->local_file;
+    } else {
+      rb_raise(eCurlErrInvalidPostField, "Cannot post file upload field with no data");
+    }
+    remote = form_string_snapshot(rbcpf->remote_file, strings);
+  } else if (NIL_P(content)) {
+    rb_raise(eCurlErrInvalidPostField, "Cannot post content field with no data");
+  }
+  if (!NIL_P(rbcpf->content_type)) {
+    type = form_string_snapshot(rbcpf->content_type, strings);
+  }
+
+  /* No Ruby calls after extracting pointers. The request owns all snapshots;
+   * libcurl copies names/ordinary contents and borrows only file buffers. */
+  form[n].option = CURLFORM_COPYNAME;
+  form[n++].value = RSTRING_PTR(name);
+  if (is_file) {
+    form[n].option = NIL_P(content) ? CURLFORM_FILE : CURLFORM_BUFFER;
+    form[n++].value = RSTRING_PTR(NIL_P(content) ? local : remote);
+    if (NIL_P(content)) {
+      form[n].option = CURLFORM_FILENAME;
+      form[n++].value = RSTRING_PTR(remote);
     }
   }
-  
+  if (!NIL_P(type)) {
+    form[n].option = CURLFORM_CONTENTTYPE;
+    form[n++].value = RSTRING_PTR(type);
+  }
+  form[n].option = CURLFORM_END;
+  form[n].value = NULL;
+
+  if (NIL_P(content)) {
+    result = curl_formadd(first, last, CURLFORM_ARRAY, form, CURLFORM_END);
+  } else {
+    result = curl_formadd(first, last, CURLFORM_ARRAY, form,
+                         is_file ? CURLFORM_BUFFERPTR : CURLFORM_COPYCONTENTS,
+                         RSTRING_PTR(content),
+                         is_file ? CURLFORM_BUFFERLENGTH : CURLFORM_CONTENTSLENGTH,
+                         RSTRING_LEN(content), CURLFORM_END);
+  }
+
   if (result != 0) {
     const char *reason = NULL;
     

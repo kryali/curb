@@ -250,7 +250,7 @@ static void rb_curl_multi_detach_all(ruby_curl_multi *rbcm);
 static void curl_multi_mark(void *ptr);
 static void ruby_curl_multi_ensure_handle(ruby_curl_multi *rbcm);
 static int rb_curl_multi_has_easy(ruby_curl_multi *rbcm, ruby_curl_easy *rbce);
-static void rb_curl_multi_remove_request_reference(VALUE self, VALUE easy);
+void rb_curl_multi_remove_request_reference(VALUE self, VALUE easy);
 static VALUE ruby_curl_multi_mark_closed(VALUE self);
 static VALUE ruby_curl_multi_alloc(VALUE klass);
 static VALUE ruby_curl_multi_initialize(VALUE self);
@@ -494,7 +494,29 @@ static int rb_curl_multi_has_easy(ruby_curl_multi *rbcm, ruby_curl_easy *rbce) {
   return st_lookup(rbcm->attached, (st_data_t)rbce, &value);
 }
 
-static void rb_curl_multi_remove_request_reference(VALUE self, VALUE easy) {
+/* Attachment, rather than easy.multi alone, distinguishes a live transfer
+ * from a completed easy whose status callback still sees its former multi. */
+int rb_curl_multi_easy_performing(void *rbce_ptr) {
+  ruby_curl_easy *rbce = (ruby_curl_easy *)rbce_ptr;
+  ruby_curl_multi *rbcm = ruby_curl_multi_pointer_if_compatible(rbce->multi);
+  return rbcm && rbcm->perform_active && rb_curl_multi_has_easy(rbcm, rbce);
+}
+
+static void ruby_curl_multi_check_thread(ruby_curl_multi *rbcm) {
+  if (rbcm->perform_active && rbcm->perform_thread != rb_thread_current()) {
+    rb_raise(rb_eRuntimeError, "Cannot access a Curl::Multi handle performing on another thread");
+  }
+}
+
+void rb_curl_multi_check_easy_thread(void *rbce_ptr) {
+  ruby_curl_easy *rbce = (ruby_curl_easy *)rbce_ptr;
+  ruby_curl_multi *rbcm = ruby_curl_multi_pointer_if_compatible(rbce->multi);
+  if (rbcm && rb_curl_multi_has_easy(rbcm, rbce)) {
+    ruby_curl_multi_check_thread(rbcm);
+  }
+}
+
+void rb_curl_multi_remove_request_reference(VALUE self, VALUE easy) {
   VALUE requests;
   VALUE object_id;
   VALUE safety_signatures;
@@ -569,6 +591,7 @@ static void ruby_curl_multi_init(ruby_curl_multi *rbcm) {
   rbcm->running = 0;
   rbcm->closed = 0;
   rbcm->perform_active = 0;
+  rbcm->perform_thread = Qnil;
   rbcm->callback_active = 0;
   rbcm->allow_close_during_perform = 0;
 
@@ -586,6 +609,7 @@ static void ruby_curl_multi_init(ruby_curl_multi *rbcm) {
 }
 
 static void ruby_curl_multi_ensure_handle(ruby_curl_multi *rbcm) {
+  ruby_curl_multi_check_thread(rbcm);
   if (!rbcm->handle) {
     if (rbcm->closed) {
       raise_curl_multi_error_exception(CURLM_BAD_HANDLE);
@@ -614,6 +638,10 @@ static VALUE ruby_curl_multi_initialize(VALUE self) {
   ruby_curl_multi *rbcm;
 
   TypedData_Get_Struct(self, ruby_curl_multi, &ruby_curl_multi_data_type, rbcm);
+
+  if (rbcm->perform_active) {
+    rb_raise(rb_eRuntimeError, "Cannot initialize an active Curl::Multi handle during perform");
+  }
 
   ruby_curl_multi_init(rbcm);
 
@@ -846,6 +874,7 @@ VALUE ruby_curl_multi_remove(VALUE self, VALUE rb_easy_handle) {
 
   TypedData_Get_Struct(self, ruby_curl_multi, &ruby_curl_multi_data_type, rbcm);
 
+  ruby_curl_multi_check_thread(rbcm);
   rb_curl_multi_remove(rbcm, rb_easy_handle);
 
   return self;
@@ -2514,6 +2543,7 @@ static VALUE ruby_curl_multi_perform_guard_ensure(VALUE self) {
   ruby_curl_multi *rbcm;
   TypedData_Get_Struct(self, ruby_curl_multi, &ruby_curl_multi_data_type, rbcm);
   rbcm->perform_active = 0;
+  rbcm->perform_thread = Qnil;
   rbcm->callback_active = 0;
   rbcm->allow_close_during_perform = 0;
   return Qnil;
@@ -2528,7 +2558,11 @@ static VALUE ruby_curl_multi_with_perform_guard(int argc, VALUE *argv, VALUE sel
     rb_raise(rb_eRuntimeError, "Cannot recursively perform an active Curl::Multi handle");
   }
 
+  /* Reopening an autoclosed multi initializes its guard fields. Do this before
+   * claiming ownership so repeated performs retain the full-lifetime guard. */
+  ruby_curl_multi_ensure_handle(rbcm);
   rbcm->perform_active = 1;
+  rbcm->perform_thread = rb_thread_current();
   args.argc = argc;
   args.argv = argv;
   args.self = self;
@@ -2585,6 +2619,7 @@ VALUE ruby_curl_multi_close(VALUE self) {
   ruby_curl_multi *rbcm;
   TypedData_Get_Struct(self, ruby_curl_multi, &ruby_curl_multi_data_type, rbcm);
 
+  ruby_curl_multi_check_thread(rbcm);
   if ((rbcm->perform_active || rbcm->callback_active) && !rbcm->allow_close_during_perform) {
     rb_raise(rb_eRuntimeError, "Cannot close an active Curl::Multi handle during perform");
   }
@@ -2622,6 +2657,7 @@ static int mark_attached_i(st_data_t key, st_data_t val, st_data_t arg) {
 static void curl_multi_mark(void *ptr) {
   ruby_curl_multi *rbcm = (ruby_curl_multi *)ptr;
   if (!rbcm) return;
+  rb_gc_mark(rbcm->perform_thread);
   if (rbcm->attached) {
     st_foreach(rbcm->attached, mark_attached_i, (st_data_t)0);
   }

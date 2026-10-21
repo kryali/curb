@@ -17,6 +17,7 @@ typedef struct {
   int running;
   char closed;
   char perform_active;
+  VALUE perform_thread; /* Owner while a drive loop may release the GVL. */
   char callback_active;
   char allow_close_during_perform;
   CURLM *handle;
@@ -31,6 +32,9 @@ extern VALUE cCurlMulti;
 extern const rb_data_type_t ruby_curl_multi_data_type;
 
 void init_curb_multi();
+int rb_curl_multi_easy_performing(void *rbce_ptr);
+void rb_curl_multi_check_easy_thread(void *rbce_ptr);
+void rb_curl_multi_remove_request_reference(VALUE self, VALUE easy);
 void rb_curl_multi_forget_easy(ruby_curl_multi *rbcm, void *rbce_ptr);
 CURLMcode rb_curl_multi_detach_easy(ruby_curl_multi *rbcm, void *rbce_ptr);
 
