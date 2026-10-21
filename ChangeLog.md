@@ -1,5 +1,6 @@
 # ChangeLog
 ## 1.4.1 (unreleased)
+* Fix crashes and uninitialized-memory reads when native operations are called on `Curl::Easy.allocate` or subclasses whose initializer omits `super`: reject uninitialized handles with `Curl::Err::FailedInitError`, initialize connection-info outputs, and check libcurl errors. Repeated `initialize` now detaches and frees the previous handle and rejects reinitialization during callbacks or native operations. Add regression coverage for allocation, subclasses, getters, lifecycle operations, and repeated initialization.
 * Fix a use-after-free when `Curl::Easy#clone` or `#dup` is called from a callback during a multipart request: detach the temporary form from the clone before the original request frees it, and reset the clone's callback state. Supply new `PostField` objects to send a multipart request with the clone. Add regression coverage for body, header, progress, debug, and completion callbacks.
 
 ## 1.4.0

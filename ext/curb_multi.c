@@ -781,7 +781,7 @@ VALUE ruby_curl_multi_add(VALUE self, VALUE easy) {
   ruby_curl_multi *existing_rbcm;
 
   TypedData_Get_Struct(self, ruby_curl_multi, &ruby_curl_multi_data_type, rbcm);
-  TypedData_Get_Struct(easy, ruby_curl_easy, &ruby_curl_easy_data_type, rbce);
+  rbce = ruby_curl_easy_get_handle(easy);
   ruby_curl_multi_ensure_handle(rbcm);
 
   if (rb_curl_multi_has_easy(rbcm, rbce)) {
@@ -855,7 +855,7 @@ static void rb_curl_multi_remove(ruby_curl_multi *rbcm, VALUE easy) {
   CURLMcode result;
   ruby_curl_easy *rbce;
 
-  TypedData_Get_Struct(easy, ruby_curl_easy, &ruby_curl_easy_data_type, rbce);
+  rbce = ruby_curl_easy_get_handle(easy);
   result = curl_multi_remove_handle(rbcm->handle, rbce->curl);
   if (result != 0) {
     raise_curl_multi_error_exception(result);
@@ -1022,7 +1022,8 @@ static VALUE rb_curl_multi_run_completion_callbacks(VALUE argp) {
   VALUE easy_callback_error = Qnil;
   VALUE callargs;
   VALUE did_raise = rb_hash_new();
-  long redirect_count;
+  long redirect_count = 0;
+  CURLcode info_result;
 
   args->rbcm->callback_active = 1;
 
@@ -1040,12 +1041,18 @@ static VALUE rb_curl_multi_run_completion_callbacks(VALUE argp) {
   }
 
 #ifdef HAVE_CURLINFO_RESPONSE_CODE
-  curl_easy_getinfo(args->rbce->curl, CURLINFO_RESPONSE_CODE, &response_code);
+  info_result = curl_easy_getinfo(args->rbce->curl, CURLINFO_RESPONSE_CODE, &response_code);
 #else /* use fdsets path for waiting */
   // old libcurl
-  curl_easy_getinfo(args->rbce->curl, CURLINFO_HTTP_CODE, &response_code);
+  info_result = curl_easy_getinfo(args->rbce->curl, CURLINFO_HTTP_CODE, &response_code);
 #endif
-  curl_easy_getinfo(args->rbce->curl, CURLINFO_REDIRECT_COUNT, &redirect_count);
+  if (info_result != CURLE_OK) {
+    raise_curl_easy_error_exception(info_result);
+  }
+  info_result = curl_easy_getinfo(args->rbce->curl, CURLINFO_REDIRECT_COUNT, &redirect_count);
+  if (info_result != CURLE_OK) {
+    raise_curl_easy_error_exception(info_result);
+  }
 
   if (args->result != 0) {
     if (!rb_easy_nil("failure_proc")) {

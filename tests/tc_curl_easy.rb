@@ -10,6 +10,98 @@ class FooBadToS
 end
 
 class TestCurbCurlEasy < Test::Unit::TestCase
+  CONNECTION_INFO_METHODS = %i[
+    last_effective_url response_code code primary_ip http_connect_code file_time
+    total_time name_lookup_time connect_time app_connect_time pre_transfer_time
+    start_transfer_time redirect_time redirect_count redirect_url downloaded_bytes
+    uploaded_bytes download_speed upload_speed header_size request_size
+    ssl_verify_result downloaded_content_length uploaded_content_length content_type
+    os_errno num_connects cookielist ftp_entry_path
+  ].freeze
+
+  def test_uninitialized_handles_reject_native_operations
+    subclass = Class.new(Curl::Easy) { def initialize; end }
+    [Curl::Easy.allocate, subclass.new].each do |easy|
+      methods = CONNECTION_INFO_METHODS + %i[reset close clone dup perform]
+      methods.each do |method|
+        next unless easy.respond_to?(method)
+        error = assert_raise(Curl::Err::FailedInitError, method.to_s) { easy.public_send(method) }
+        assert_match(/not initialized/, error.message)
+      end
+      [[:escape, "x"], [:unescape, "x"], [:setopt, Curl::CURLOPT_VERBOSE, true],
+       [:http_post, "x"], [:http_put, "x"], [:http_patch, "x"]].each do |args|
+        assert_raise(Curl::Err::FailedInitError, args.first.to_s) { easy.public_send(*args) }
+      end
+      multi = Curl::Multi.new
+      begin
+        assert_raise(Curl::Err::FailedInitError) { multi.add(easy) }
+        assert_raise(Curl::Err::FailedInitError) { multi.send(:_remove, easy) }
+      ensure
+        multi.close
+      end
+    end
+  end
+
+  def test_allocated_handle_can_be_initialized
+    easy = Curl::Easy.allocate
+    easy.send(:initialize, $TEST_URL)
+    easy.perform
+    assert_equal $TEST_URL, easy.last_effective_url
+    assert_match(/^# DO NOT REMOVE THIS COMMENT/, easy.body_str)
+  end
+
+  def test_connection_info_before_perform
+    easy = Curl::Easy.new
+    CONNECTION_INFO_METHODS.each do |method|
+      next unless easy.respond_to?(method)
+      assert_nothing_raised(method.to_s) { easy.public_send(method) }
+    end
+    assert_nil easy.last_effective_url
+    assert_nil easy.content_type
+    assert_equal 0, easy.response_code
+  end
+
+  def test_reinitialize_detaches_previous_handle
+    easy = Curl::Easy.new($TEST_URL)
+    easy.headers = { "X-Old" => "old" }
+    multi = Curl::Multi.new
+    multi.add(easy)
+    easy.send(:initialize, $TEST_URL)
+    assert_nil easy.multi
+    assert_equal({}, easy.headers)
+    multi.perform
+    easy.perform
+    assert_match(/^# DO NOT REMOVE THIS COMMENT/, easy.body_str)
+    multi.add(easy)
+    multi.perform
+    assert_match(/^# DO NOT REMOVE THIS COMMENT/, easy.body_str)
+  ensure
+    multi.close if multi
+  end
+
+  def test_reinitialize_during_callback_is_blocked
+    easy = Curl::Easy.new($TEST_URL)
+    easy.on_body do |data|
+      error = assert_raise(RuntimeError) { easy.send(:initialize, $TEST_URL) }
+      assert_match(/Cannot initialize an active curl handle/, error.message)
+      data.bytesize
+    end
+    easy.perform
+    easy.send(:initialize, $TEST_URL)
+    easy.perform
+    assert_match(/^# DO NOT REMOVE THIS COMMENT/, easy.body_str)
+  end
+
+  def test_reinitialize_during_argument_coercion_is_blocked
+    easy = Curl::Easy.new($TEST_URL)
+    field = Object.new
+    field.define_singleton_method(:to_s) { easy.send(:initialize, $TEST_URL); "a=b" }
+    error = assert_raise(RuntimeError) { easy.http_post(field) }
+    assert_match(/Cannot initialize an active curl handle/, error.message)
+    easy.perform
+    assert_match(/^# DO NOT REMOVE THIS COMMENT/, easy.body_str)
+  end
+
   def test_global_reset
     Curl.get($TEST_URL)
     # in a Timeout block you should reset the thread current handle 

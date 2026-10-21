@@ -125,6 +125,8 @@ typedef struct {
 extern VALUE cCurlEasy;
 extern const rb_data_type_t ruby_curl_easy_data_type;
 
+ruby_curl_easy *ruby_curl_easy_get_handle(VALUE self);
+
 VALUE ruby_curl_easy_setup(ruby_curl_easy *rbce);
 VALUE ruby_curl_easy_cleanup(VALUE self, ruby_curl_easy *rbce);
 VALUE rb_curl_easy_take_callback_error(ruby_curl_easy *rbce);
