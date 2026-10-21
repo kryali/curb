@@ -46,16 +46,18 @@ void append_to_form(VALUE self,
         if (rbcpf->remote_file == Qnil) {
           rb_raise(eCurlErrInvalidPostField, "Cannot post file upload field with no filename");
         } else {
+          /* Coerce before reading the pointer/length; keep the string GC-rooted. */
+          StringValue(rbcpf->buffer_str);
           if (rbcpf->content_type == Qnil) {
             result = curl_formadd(first, last, CURLFORM_PTRNAME, StringValuePtr(rbcpf->name), 
                                                CURLFORM_BUFFER, StringValuePtr(rbcpf->remote_file),
-                                               CURLFORM_BUFFERPTR, StringValuePtr(rbcpf->buffer_str),
+                                               CURLFORM_BUFFERPTR, RSTRING_PTR(rbcpf->buffer_str),
                                                CURLFORM_BUFFERLENGTH, RSTRING_LEN(rbcpf->buffer_str),
                                                CURLFORM_END);
           } else {
             result = curl_formadd(first, last, CURLFORM_PTRNAME, StringValuePtr(rbcpf->name), 
                                                CURLFORM_BUFFER, StringValuePtr(rbcpf->remote_file),
-                                               CURLFORM_BUFFERPTR, StringValuePtr(rbcpf->buffer_str),
+                                               CURLFORM_BUFFERPTR, RSTRING_PTR(rbcpf->buffer_str),
                                                CURLFORM_BUFFERLENGTH, RSTRING_LEN(rbcpf->buffer_str),
                                                CURLFORM_CONTENTTYPE, StringValuePtr(rbcpf->content_type),
                                                CURLFORM_END);
@@ -66,16 +68,18 @@ void append_to_form(VALUE self,
         if (rbcpf->remote_file == Qnil) {
           rb_raise(eCurlErrInvalidPostField, "Cannot post file upload field with no filename");
         } else {
+          /* Coerce before reading the pointer/length; keep the string GC-rooted. */
+          StringValue(rbcpf->content);
           if (rbcpf->content_type == Qnil) {
             result = curl_formadd(first, last, CURLFORM_PTRNAME, StringValuePtr(rbcpf->name), 
                                                CURLFORM_BUFFER, StringValuePtr(rbcpf->remote_file),
-                                               CURLFORM_BUFFERPTR, StringValuePtr(rbcpf->content),
+                                               CURLFORM_BUFFERPTR, RSTRING_PTR(rbcpf->content),
                                                CURLFORM_BUFFERLENGTH, RSTRING_LEN(rbcpf->content),
                                                CURLFORM_END);
           } else {
             result = curl_formadd(first, last, CURLFORM_PTRNAME, StringValuePtr(rbcpf->name), 
                                                CURLFORM_BUFFER, StringValuePtr(rbcpf->remote_file),
-                                               CURLFORM_BUFFERPTR, StringValuePtr(rbcpf->content),
+                                               CURLFORM_BUFFERPTR, RSTRING_PTR(rbcpf->content),
                                                CURLFORM_BUFFERLENGTH, RSTRING_LEN(rbcpf->content),
                                                CURLFORM_CONTENTTYPE, StringValuePtr(rbcpf->content_type),
                                                CURLFORM_END);
@@ -110,28 +114,30 @@ void append_to_form(VALUE self,
       // is a content field
       if (rbcpf->content_proc != Qnil) {
         rbcpf->buffer_str = rb_funcall(rbcpf->content_proc, idCall, 1, self);
-        
+        StringValue(rbcpf->buffer_str);
+
         if (rbcpf->content_type == Qnil) {
           result = curl_formadd(first, last, CURLFORM_PTRNAME, StringValuePtr(rbcpf->name), 
-                                             CURLFORM_PTRCONTENTS, StringValuePtr(rbcpf->buffer_str),
+                                             CURLFORM_PTRCONTENTS, RSTRING_PTR(rbcpf->buffer_str),
                                              CURLFORM_CONTENTSLENGTH, RSTRING_LEN(rbcpf->buffer_str),
                                              CURLFORM_END);
         } else {
           result = curl_formadd(first, last, CURLFORM_PTRNAME, StringValuePtr(rbcpf->name), 
-                                             CURLFORM_PTRCONTENTS, StringValuePtr(rbcpf->buffer_str),
+                                             CURLFORM_PTRCONTENTS, RSTRING_PTR(rbcpf->buffer_str),
                                              CURLFORM_CONTENTSLENGTH, RSTRING_LEN(rbcpf->buffer_str),
                                              CURLFORM_CONTENTTYPE, StringValuePtr(rbcpf->content_type),
                                              CURLFORM_END);
         }
       } else if (rbcpf->content != Qnil) {
+        StringValue(rbcpf->content);
         if (rbcpf->content_type == Qnil) {
           result = curl_formadd(first, last, CURLFORM_PTRNAME, StringValuePtr(rbcpf->name), 
-                                             CURLFORM_PTRCONTENTS, StringValuePtr(rbcpf->content),
+                                             CURLFORM_PTRCONTENTS, RSTRING_PTR(rbcpf->content),
                                              CURLFORM_CONTENTSLENGTH, RSTRING_LEN(rbcpf->content),
                                              CURLFORM_END);
         } else {
           result = curl_formadd(first, last, CURLFORM_PTRNAME, StringValuePtr(rbcpf->name), 
-                                             CURLFORM_PTRCONTENTS, StringValuePtr(rbcpf->content),
+                                             CURLFORM_PTRCONTENTS, RSTRING_PTR(rbcpf->content),
                                              CURLFORM_CONTENTSLENGTH, RSTRING_LEN(rbcpf->content),
                                              CURLFORM_CONTENTTYPE, StringValuePtr(rbcpf->content_type),
                                              CURLFORM_END);

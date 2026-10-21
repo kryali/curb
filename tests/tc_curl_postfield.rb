@@ -253,6 +253,55 @@ class TestCurbCurlPostfieldMultipartCoverage < Test::Unit::TestCase
     server_setup
   end
 
+  # Exercise each pointer/length pair with and without a content type.
+  [:content, :file].each do |kind|
+    [false, true].each do |dynamic|
+      [nil, 'text/plain'].each do |content_type|
+        variant = "#{kind}_#{dynamic ? 'proc' : 'direct'}_#{content_type ? 'typed' : 'untyped'}"
+
+        define_method("test_multipart_coerces_#{variant}") do
+          payload = "before\0after"
+          string_like = Object.new
+          string_like.define_singleton_method(:to_str) { payload }
+          field = multipart_field(kind, dynamic, content_type, string_like)
+          curl = Curl::Easy.new(TestServlet.url)
+          curl.multipart_form_post = true
+
+          curl.http_post(field)
+
+          assert_include curl.body_str, payload
+          assert_equal payload, field.content unless dynamic
+        end
+
+        define_method("test_multipart_rejects_non_string_#{variant}") do
+          field = multipart_field(kind, dynamic, content_type, 5)
+          curl = Curl::Easy.new(TestServlet.url)
+          curl.multipart_form_post = true
+
+          assert_raise(TypeError) { curl.http_post(field) }
+        end
+      end
+    end
+  end
+
+  def multipart_field(kind, dynamic, content_type, value)
+    field = if dynamic
+      if kind == :file
+        Curl::PostField.file('upload', 'remote.txt') { value }
+      else
+        Curl::PostField.content('value') { value }
+      end
+    elsif kind == :file
+      upload = Curl::PostField.file('upload', 'remote.txt')
+      upload.content = value
+      upload
+    else
+      Curl::PostField.content('value', value)
+    end
+    field.content_type = content_type
+    field
+  end
+
   def test_multipart_content_variants_include_dynamic_and_typed_fields
     curl = Curl::Easy.new(TestServlet.url)
     curl.multipart_form_post = true
