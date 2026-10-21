@@ -10,6 +10,94 @@ class TestCurbCurlMaxFileSize < Test::Unit::TestCase
     super
   end
 
+  def test_safe_body_limit_defaults_and_raw_requests
+    assert_equal 10 * 1024 * 1024, Curl::SafetyConfig.new.max_body_bytes
+    assert_nil @easy.max_body_bytes
+    stub_public_network_policy_for_local_fixture(@easy)
+    @easy.safe_http!
+    assert_equal Curl::SafetyConfig::DEFAULT_MAX_BODY_BYTES, @easy.max_body_bytes
+    @easy.max_body_bytes = nil
+    Curl.__send__(:apply_safety!, @easy)
+    assert_equal Curl::SafetyConfig::DEFAULT_MAX_BODY_BYTES, @easy.max_body_bytes
+  end
+
+  [:global, :helper, :handle].each do |mode|
+    define_method("test_#{mode}_default_body_limit_rejects_oversized_response") do
+      payload = 'x' * (Curl::SafetyConfig::DEFAULT_MAX_BODY_BYTES + 1)
+      with_raw_http_response("HTTP/1.1 200 OK\r\nContent-Length: #{payload.bytesize}\r\n\r\n#{payload}") do |url|
+        assert_body_limit_error do
+          if mode == :helper
+            Curl.safe_get(url) { |easy| stub_public_network_policy_for_local_fixture(easy) }
+          else
+            Curl.safe! if mode == :global
+            @easy.url = url
+            stub_public_network_policy_for_local_fixture(@easy)
+            @easy.safe_http! if mode == :handle
+            @easy.perform
+          end
+        end
+      end
+    end
+  end
+
+  def test_default_body_limit_bounds_callback_delivery_without_content_length
+    limit = Curl::SafetyConfig::DEFAULT_MAX_BODY_BYTES
+    payload = 'x' * (limit + 1)
+    received = 0
+    with_raw_http_response("HTTP/1.0 200 OK\r\n\r\n#{payload}") do |url|
+      @easy.url = url
+      stub_public_network_policy_for_local_fixture(@easy)
+      @easy.safe_http!
+      @easy.on_body { |data| received += data.bytesize; data.bytesize }
+      assert_body_limit_error { @easy.perform }
+    end
+    assert_operator received, :<=, limit
+    assert_operator received, :>, 0
+  end
+
+  def test_global_body_limit_can_be_explicitly_disabled
+    Curl.safe! { |config| config.max_body_bytes = nil }
+    stub_public_network_policy_for_local_fixture(@easy)
+    @easy.safe_http!
+    assert_nil @easy.max_body_bytes
+  end
+
+  def test_safe_helper_accepts_explicit_larger_limit_and_unlimited
+    [20 * 1024 * 1024, nil, 0].each do |limit|
+      with_raw_http_response("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok") do |url|
+        easy = Curl.safe_get(url, :max_body_bytes => limit) do |handle|
+          stub_public_network_policy_for_local_fixture(handle)
+        end
+        assert_equal(limit == 0 ? nil : limit, easy.max_body_bytes)
+        assert_equal 'ok', easy.body_str
+      end
+    end
+  end
+
+  def test_safe_helper_inherits_global_body_limit
+    Curl.safe! { |config| config.max_body_bytes = 20 * 1024 * 1024 }
+    stub_public_network_policy_for_local_fixture(@easy)
+    @easy.safe_http!
+    assert_equal 20 * 1024 * 1024, @easy.max_body_bytes
+  end
+
+  def test_safe_helper_cannot_weaken_global_body_limit
+    Curl.safe! { |config| config.max_body_bytes = 10 }
+    [100, nil, 0].each do |limit|
+      with_raw_http_response("HTTP/1.1 200 OK\r\nContent-Length: 64\r\n\r\n#{'x' * 64}") do |url|
+        assert_body_limit_error do
+          Curl.safe_get(url, :max_body_bytes => limit) do |handle|
+            stub_public_network_policy_for_local_fixture(handle)
+          end
+        end
+      end
+    end
+  end
+
+  def test_safe_http_rejects_negative_body_limit
+    assert_raise(ArgumentError) { @easy.safe_http!(:max_body_bytes => -1) }
+  end
+
   def test_maxfilesize_setopt
     @easy.set(Curl::CURLOPT_MAXFILESIZE, 5000000)
     @easy.set(Curl::CURLOPT_MAXFILESIZE_LARGE, 5000000) if Curl.const_defined?(:CURLOPT_MAXFILESIZE_LARGE)
@@ -64,6 +152,7 @@ class TestCurbCurlMaxFileSize < Test::Unit::TestCase
       end
 
       @easy.url = url
+      stub_public_network_policy_for_local_fixture(@easy)
 
       assert_body_limit_error do
         @easy.perform
@@ -79,6 +168,7 @@ class TestCurbCurlMaxFileSize < Test::Unit::TestCase
 
       assert_body_limit_error do
         Curl.get(url) do |easy|
+          stub_public_network_policy_for_local_fixture(easy)
           easy.max_body_bytes = nil
         end
       end
@@ -206,8 +296,13 @@ class TestCurbCurlMaxFileSize < Test::Unit::TestCase
         socket.readpartial(4096)
       rescue EOFError
       end
-      socket.write(response)
-      socket.close
+      begin
+        socket.write(response)
+      rescue Errno::EPIPE, Errno::ECONNRESET
+        # Expected when the client aborts at the body limit.
+      ensure
+        socket.close
+      end
     end
 
     yield "http://127.0.0.1:#{port}/"

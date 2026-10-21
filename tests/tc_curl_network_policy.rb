@@ -12,6 +12,46 @@ class TestCurbCurlNetworkPolicy < Test::Unit::TestCase
     super
   end
 
+  def test_safe_bang_defaults_to_public_network_policy
+    assert_equal :public, Curl::SafetyConfig.new.network_policy
+    require_public_network_policy!
+    Curl.safe!
+
+    assert_raise(Curl::Err::UnsafeDestinationError) { Curl.get(TestServlet.url) }
+    easy = Curl::Easy.new(TestServlet.url)
+    easy.network_policy = :none
+    assert_raise(Curl::Err::UnsafeDestinationError) { easy.perform }
+    assert_equal :public, easy.network_policy
+  end
+
+  def test_safe_bang_default_blocks_private_and_metadata_destinations
+    require_public_network_policy!
+    Curl.safe!
+    ['10.0.0.1', '172.16.0.1', '192.168.0.1', '169.254.169.254', '[::1]'].each do |host|
+      assert_raise(Curl::Err::UnsafeDestinationError, host) do
+        Curl.get("http://#{host}/") do |easy|
+          easy.network_policy = :none
+          easy.connect_timeout_ms = 100
+          easy.timeout_ms = 200
+        end
+      end
+    end
+  end
+
+  def test_safe_bang_default_applies_to_previously_added_multi_handles
+    require_public_network_policy!
+    easy = Curl::Easy.new(TestServlet.url)
+    multi = Curl::Multi.new
+    multi.add(easy)
+    Curl.safe!
+    multi.perform
+
+    assert_equal :public, easy.network_policy
+    assert_match(/127\.0\.0\.1/, easy.unsafe_destination_error)
+  ensure
+    multi.close if multi
+  end
+
   def test_safe_helpers_block_loopback_without_global_policy
     require_public_network_policy!
     [:get, :post, :put, :delete, :patch, :head, :options].each do |verb|
@@ -159,6 +199,7 @@ class TestCurbCurlNetworkPolicy < Test::Unit::TestCase
 
     with_host_redirect_server(allowed_host, allowed_host) do |port, hits|
       Curl.safe! do |config|
+        config.network_policy = :none # Isolate host filtering from peer filtering.
         config.allowed_hosts = [allowed_host]
       end
 
@@ -183,6 +224,7 @@ class TestCurbCurlNetworkPolicy < Test::Unit::TestCase
 
     with_host_redirect_server(allowed_host, blocked_host) do |port, hits|
       Curl.safe! do |config|
+        config.network_policy = :none # Isolate host filtering from peer filtering.
         config.allowed_hosts = [allowed_host]
       end
 
@@ -206,6 +248,7 @@ class TestCurbCurlNetworkPolicy < Test::Unit::TestCase
 
   def test_safe_bang_allowed_cidrs_requires_public_network_policy
     Curl.safe! do |config|
+      config.network_policy = :none # Isolate the host/CIDR policy from peer filtering.
       config.allowed_cidrs = ['1.1.1.0/24']
     end
 
@@ -1144,7 +1187,7 @@ class TestCurbCurlNetworkPolicy < Test::Unit::TestCase
       multi = Curl::Multi.new
 
       multi.add(easy)
-      Curl.safe!
+      Curl.safe! { |config| config.network_policy = :none }
       multi.perform
 
       assert_equal [['1']], request_headers

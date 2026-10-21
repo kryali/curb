@@ -23,6 +23,7 @@ module Curl
 
   class SafetyConfig
     DEFAULT_PROTOCOLS = [:http, :https].freeze
+    DEFAULT_MAX_BODY_BYTES = 10 * 1024 * 1024
 
     attr_reader :max_body_bytes, :network_policy
     attr_accessor :allow_proxies, :allow_resolve, :allow_connect_to, :allow_doh, :allow_unix_socket
@@ -30,8 +31,8 @@ module Curl
     def initialize
       @protocols = DEFAULT_PROTOCOLS
       @redirect_protocols = nil
-      @max_body_bytes = nil
-      @network_policy = nil
+      @max_body_bytes = DEFAULT_MAX_BODY_BYTES
+      @network_policy = :public
       @allowed_hosts = nil
       @allowed_proxy_hosts = nil
       @allowed_cidrs = nil
@@ -655,8 +656,7 @@ module Curl
 
     http(verb, url, post_body, put_data) do |handle|
       yield handle if block
-      handle.safe_http!
-      handle.max_body_bytes = options[:max_body_bytes] if options.key?(:max_body_bytes)
+      handle.safe_http!(options)
     end
   end
 

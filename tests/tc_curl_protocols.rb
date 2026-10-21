@@ -158,8 +158,8 @@ class TestCurbCurlProtocols < Test::Unit::TestCase
     end
   end
 
-  def test_safe_bang_allows_http_protocol
-    Curl.safe!
+  def test_safe_bang_explicit_none_allows_trusted_http_destination
+    Curl.safe! { |config| config.network_policy = :none }
     easy = Curl.get(TestServlet.url)
 
     assert_equal 200, easy.response_code
@@ -198,6 +198,7 @@ class TestCurbCurlProtocols < Test::Unit::TestCase
 
       easy = Curl::Easy.new(url)
       easy.follow_location = true
+      stub_public_network_policy_for_local_fixture(easy)
 
       assert_raises Curl::Err::UnsupportedProtocolError do
         easy.perform

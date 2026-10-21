@@ -30,7 +30,10 @@ class TestCurbRactor < Test::Unit::TestCase
 
     workers = RACTOR_WORKERS.times.map do |worker_id|
       Ractor.new(url, worker_id, REQUESTS_PER_WORKER) do |target, id, request_count|
-        Curl.safe! { |config| config.protocols = [:http] }
+        Curl.safe! do |config|
+          config.protocols = [:http]
+          config.network_policy = :none # This concurrency fixture uses localhost.
+        end
         Curl::Multi.default_timeout = 25 + id
         Curl::Multi.autoclose = true
 
