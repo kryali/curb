@@ -33,8 +33,9 @@ extern VALUE cCurlPostField;
 extern const rb_data_type_t ruby_curl_postfield_data_type;
 
 typedef struct ruby_curl_form_string {
-  VALUE string;
   struct ruby_curl_form_string *next;
+  long length;
+  char *data;
 } ruby_curl_form_string;
 
 void free_form_strings(ruby_curl_form_string *strings);

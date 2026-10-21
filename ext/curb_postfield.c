@@ -20,30 +20,36 @@ VALUE cCurlPostField;
 
 /* ================= APPEND FORM FUNC ================ */
 
-/* Keep private, immutable strings alive until the request frees its form.
- * Snapshot each value before invoking any further user-defined coercions. */
-static VALUE form_string_snapshot(VALUE value, ruby_curl_form_string **strings) {
-  VALUE snapshot;
+/* Snapshot before invoking further Ruby coercions. Native storage is private
+ * to this request and cannot move under GC or require VM-global GC roots. */
+static ruby_curl_form_string *form_string_snapshot(VALUE value, ruby_curl_form_string **strings) {
   ruby_curl_form_string *entry;
+  long length;
   StringValue(value);
-  snapshot = rb_str_new(RSTRING_PTR(value), RSTRING_LEN(value));
-  rb_obj_freeze(snapshot);
-  entry = ALLOC(ruby_curl_form_string);
-  entry->string = snapshot;
+  length = RSTRING_LEN(value);
+  /* One allocation for the list entry, payload and terminating NUL. */
+  entry = ruby_xmalloc(sizeof(*entry) + (size_t)length + 1);
+  entry->data = (char *)(entry + 1);
+  entry->length = length;
+  memcpy(entry->data, RSTRING_PTR(value), (size_t)length);
+  entry->data[length] = '\0';
   entry->next = *strings;
   *strings = entry;
-  /* Register individually to pin embedded string buffers during compaction. */
-  rb_gc_register_address(&entry->string);
-  return snapshot;
+  RB_GC_GUARD(value);
+  return entry;
+}
+
+static void free_form_strings_until(ruby_curl_form_string **strings,
+                                    ruby_curl_form_string *stop) {
+  while (*strings != stop) {
+    ruby_curl_form_string *next = (*strings)->next;
+    xfree(*strings);
+    *strings = next;
+  }
 }
 
 void free_form_strings(ruby_curl_form_string *strings) {
-  while (strings) {
-    ruby_curl_form_string *next = strings->next;
-    rb_gc_unregister_address(&strings->string);
-    xfree(strings);
-    strings = next;
-  }
+  free_form_strings_until(&strings, NULL);
 }
 
 void append_to_form(VALUE self,
@@ -52,7 +58,8 @@ void append_to_form(VALUE self,
                     ruby_curl_form_string **strings) {
   ruby_curl_postfield *rbcpf;
   CURLFORMcode result = -1;
-  VALUE name, content = Qnil, remote = Qnil, local = Qnil, type = Qnil;
+  ruby_curl_form_string *name, *content = NULL, *remote = NULL, *local = NULL, *type = NULL;
+  ruby_curl_form_string *previous_strings = *strings;
   int is_file;
   struct curl_forms form[8];
   int n = 0;
@@ -73,7 +80,7 @@ void append_to_form(VALUE self,
 
   name = form_string_snapshot(rbcpf->name, strings);
   if (is_file) {
-    if (!NIL_P(content)) {
+    if (content != NULL) {
       if (NIL_P(rbcpf->remote_file)) {
         rb_raise(eCurlErrInvalidPostField, "Cannot post file upload field with no filename");
       }
@@ -84,41 +91,45 @@ void append_to_form(VALUE self,
       rb_raise(eCurlErrInvalidPostField, "Cannot post file upload field with no data");
     }
     remote = form_string_snapshot(rbcpf->remote_file, strings);
-  } else if (NIL_P(content)) {
+  } else if (content == NULL) {
     rb_raise(eCurlErrInvalidPostField, "Cannot post content field with no data");
   }
   if (!NIL_P(rbcpf->content_type)) {
     type = form_string_snapshot(rbcpf->content_type, strings);
   }
 
-  /* No Ruby calls after extracting pointers. The request owns all snapshots;
-   * libcurl copies names/ordinary contents and borrows only file buffers. */
+  /* libcurl copies metadata but borrows the private payload for the request.
+   * This avoids a second form-owned copy of ordinary field contents. */
   form[n].option = CURLFORM_COPYNAME;
-  form[n++].value = RSTRING_PTR(name);
+  form[n++].value = name->data;
   if (is_file) {
-    form[n].option = NIL_P(content) ? CURLFORM_FILE : CURLFORM_BUFFER;
-    form[n++].value = RSTRING_PTR(NIL_P(content) ? local : remote);
-    if (NIL_P(content)) {
+    form[n].option = content == NULL ? CURLFORM_FILE : CURLFORM_BUFFER;
+    form[n++].value = (content == NULL ? local : remote)->data;
+    if (content == NULL) {
       form[n].option = CURLFORM_FILENAME;
-      form[n++].value = RSTRING_PTR(remote);
+      form[n++].value = remote->data;
     }
   }
-  if (!NIL_P(type)) {
+  if (type != NULL) {
     form[n].option = CURLFORM_CONTENTTYPE;
-    form[n++].value = RSTRING_PTR(type);
+    form[n++].value = type->data;
   }
   form[n].option = CURLFORM_END;
   form[n].value = NULL;
 
-  if (NIL_P(content)) {
+  if (content == NULL) {
     result = curl_formadd(first, last, CURLFORM_ARRAY, form, CURLFORM_END);
   } else {
     result = curl_formadd(first, last, CURLFORM_ARRAY, form,
-                         is_file ? CURLFORM_BUFFERPTR : CURLFORM_COPYCONTENTS,
-                         RSTRING_PTR(content),
+                         is_file ? CURLFORM_BUFFERPTR : CURLFORM_PTRCONTENTS,
+                         content->data,
                          is_file ? CURLFORM_BUFFERLENGTH : CURLFORM_CONTENTSLENGTH,
-                         RSTRING_LEN(content), CURLFORM_END);
+                         content->length, CURLFORM_END);
   }
+
+  /* Metadata was copied by curl_formadd. Retain only the payload, if any,
+   * which was the first snapshot allocated for this field. */
+  free_form_strings_until(strings, content ? content : previous_strings);
 
   if (result != 0) {
     const char *reason = NULL;

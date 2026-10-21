@@ -79,6 +79,47 @@ class TestCurbRactor < Test::Unit::TestCase
     Curl::Multi.autoclose = original_autoclose if defined?(original_autoclose)
   end
 
+  def test_multipart_snapshots_are_private_to_parallel_ractors
+    omit_unless_curb_ractor_safe
+    worker_count = Integer(ENV.fetch('CURB_MULTIPART_RACTORS', '4'))
+    request_count = Integer(ENV.fetch('CURB_MULTIPART_REQUESTS', '5'))
+    workers = worker_count.times.map do |worker_id|
+      Ractor.new(TestServlet.url, worker_id, request_count) do |url, id, count|
+        easy = Curl::Easy.new(url)
+        easy.multipart_form_post = true
+        count.times do |iteration|
+          name = +"field_#{id}_#{iteration}"
+          payload = "payload_#{id}_#{iteration}\0" + ('x' * 1024)
+          expected_name = name.dup
+          expected_payload = payload.dup
+          direct = Curl::PostField.content(name, payload, 'application/octet-stream')
+          file = Curl::PostField.file('upload', 'payload.bin') { payload }
+          later = Curl::PostField.content('later') do
+            name.replace('changed' * 1000)
+            payload.replace('changed' * 1000)
+            if iteration % 10 == 0
+              GC.start
+              GC.compact if GC.respond_to?(:compact)
+            end
+            'done'
+          end
+          easy.http_post(direct, file, later)
+          body = easy.body_str
+          unless easy.response_code == 200 &&
+                 body.include?("name=\"#{expected_name}\"") &&
+                 body.include?('filename="payload.bin"') &&
+                 body.scan(expected_payload).length == 2 &&
+                 !body.include?('changed')
+            raise "Multipart snapshot changed in Ractor #{id}, request #{iteration}"
+          end
+        end
+        easy.close
+        count
+      end
+    end
+    assert_equal Array.new(worker_count, request_count), workers.map { |worker| ractor_value(worker) }
+  end
+
   private
 
   def omit_unless_curb_ractor_safe
