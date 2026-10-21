@@ -187,7 +187,8 @@ module Curl
     def safe_http!
       __curb_set_safety_override!(
         :protocols => [:http, :https],
-        :redirect_protocols => [:http, :https]
+        :redirect_protocols => [:http, :https],
+        :network_policy => :public
       )
     end
 
@@ -198,6 +199,7 @@ module Curl
       @__curb_safety_override[:protocols] = Array(options[:protocols]).map { |protocol| protocol.to_s.downcase.to_sym } if options.key?(:protocols)
       @__curb_safety_override[:redirect_protocols] = Array(options[:redirect_protocols]).map { |protocol| protocol.to_s.downcase.to_sym } if options.key?(:redirect_protocols)
       @__curb_safety_override[:max_body_bytes] = options[:max_body_bytes] if options.key?(:max_body_bytes) && options[:max_body_bytes]
+      @__curb_safety_override[:network_policy] = options[:network_policy] if options.key?(:network_policy)
       @__curb_safety_override_generation = __curb_safety_override_generation + 1
       Curl.__send__(:apply_safety!, self) if Curl.respond_to?(:apply_safety!, true)
       self

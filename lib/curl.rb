@@ -217,9 +217,11 @@ module Curl
     apply_allowed_hosts!(easy, config.allowed_hosts) if config&.allowed_hosts
     apply_allowed_cidrs!(easy, config) if config&.allowed_cidrs
 
-    if config&.network_policy
-      easy.network_policy = config.network_policy
-      apply_public_network_policy_controls!(easy, config) if config.network_policy == :public
+    network_policy = config&.network_policy
+    network_policy = :public if override && override[:network_policy] == :public
+    if network_policy
+      easy.network_policy = network_policy
+      apply_public_network_policy_controls!(easy, config || SafetyConfig.new) if network_policy == :public
     end
 
     apply_max_body_bytes!(easy, config.max_body_bytes) if config&.max_body_bytes

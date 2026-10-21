@@ -12,6 +12,70 @@ class TestCurbCurlNetworkPolicy < Test::Unit::TestCase
     super
   end
 
+  def test_safe_helpers_block_loopback_without_global_policy
+    require_public_network_policy!
+    [:get, :post, :put, :delete, :patch, :head, :options].each do |verb|
+      assert_raise(Curl::Err::UnsafeDestinationError, verb.to_s) do
+        Curl.public_send("safe_#{verb}", TestServlet.url) do |easy|
+          easy.network_policy = :none
+        end
+      end
+    end
+  end
+
+  def test_safe_http_reapplies_public_policy_before_perform
+    require_public_network_policy!
+    easy = Curl::Easy.new(TestServlet.url)
+    assert_same easy, easy.safe_http!
+    assert_equal :public, easy.network_policy
+    easy.network_policy = :none
+
+    assert_raise(Curl::Err::UnsafeDestinationError) { easy.perform }
+  end
+
+  def test_safe_http_cannot_be_weakened_by_global_policy
+    require_public_network_policy!
+    Curl.safe! { |config| config.network_policy = :none }
+
+    assert_raise(Curl::Err::UnsafeDestinationError) { Curl.safe_get(TestServlet.url) }
+  end
+
+  def test_safe_helpers_block_private_and_metadata_destinations
+    require_public_network_policy!
+    ['10.0.0.1', '172.16.0.1', '192.168.0.1', '169.254.169.254', '[::1]'].each do |host|
+      assert_raise(Curl::Err::UnsafeDestinationError, host) do
+        Curl.safe_get("http://#{host}/") do |easy|
+          easy.connect_timeout_ms = 100
+          easy.timeout_ms = 200
+        end
+      end
+    end
+  end
+
+  def test_safe_http_rejects_resolve_override_without_global_policy
+    require_public_network_policy!
+    assert_raise(Curl::Err::UnsafeDestinationError) do
+      Curl.safe_get('http://example.invalid/') do |easy|
+        easy.resolve = ['example.invalid:80:127.0.0.1']
+      end
+    end
+  end
+
+  def test_safe_http_applies_to_multi
+    require_public_network_policy!
+    easy = Curl::Easy.new(TestServlet.url)
+    easy.safe_http!
+    easy.network_policy = :none
+    multi = Curl::Multi.new
+    multi.add(easy)
+    multi.perform
+
+    assert_equal :public, easy.network_policy
+    assert_match(/127\.0\.0\.1/, easy.unsafe_destination_error)
+  ensure
+    multi.close if multi
+  end
+
   def test_network_policy_defaults_to_none
     easy = Curl::Easy.new
 

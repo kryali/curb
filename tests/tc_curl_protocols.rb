@@ -104,11 +104,10 @@ class TestCurbCurlProtocols < Test::Unit::TestCase
     end
   end
 
-  def test_safe_get_allows_http_protocol
-    easy = Curl.safe_get(TestServlet.url)
-
-    assert_equal 200, easy.response_code
-    assert_match(/GET/, easy.body_str)
+  def test_safe_get_blocks_local_http_destination
+    assert_raise(Curl::Err::UnsafeDestinationError) do
+      Curl.safe_get(TestServlet.url)
+    end
   end
 
   def test_safe_bang_denies_file_protocol_for_easy_perform
@@ -184,6 +183,7 @@ class TestCurbCurlProtocols < Test::Unit::TestCase
     with_file_redirect_server do |url|
       easy = Curl::Easy.new(url)
       easy.follow_location = true
+      stub_public_network_policy_for_local_fixture(easy)
       easy.safe_http!
 
       assert_raises Curl::Err::UnsupportedProtocolError do
@@ -211,6 +211,7 @@ class TestCurbCurlProtocols < Test::Unit::TestCase
       easy.follow_location = true
       easy.ssl_verify_peer = false
       easy.ssl_verify_host = false
+      stub_public_network_policy_for_local_fixture(easy)
       easy.safe_http!
 
       easy.perform
@@ -226,6 +227,7 @@ class TestCurbCurlProtocols < Test::Unit::TestCase
       easy.follow_location = true
       easy.ssl_verify_peer = false
       easy.ssl_verify_host = false
+      stub_public_network_policy_for_local_fixture(easy)
       easy.safe_http!
 
       easy.perform
@@ -240,6 +242,7 @@ class TestCurbCurlProtocols < Test::Unit::TestCase
       easy = Curl::Easy.new(url)
       easy.follow_location = true
       easy.max_redirects = 2
+      stub_public_network_policy_for_local_fixture(easy)
       easy.safe_http!
 
       assert_raises Curl::Err::TooManyRedirectsError do
@@ -251,6 +254,14 @@ class TestCurbCurlProtocols < Test::Unit::TestCase
   end
 
   private
+
+  # Isolate protocol/redirect behavior using local fixtures. Destination blocking
+  # is exercised without this stub in tc_curl_network_policy.rb.
+  def stub_public_network_policy_for_local_fixture(easy)
+    def easy.network_policy=(policy)
+      raise "unexpected policy: #{policy}" unless policy == :public
+    end
+  end
 
   def with_file_redirect_server
     port_socket = TCPServer.new('127.0.0.1', 0)

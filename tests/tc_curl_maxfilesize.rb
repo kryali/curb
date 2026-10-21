@@ -41,7 +41,7 @@ class TestCurbCurlMaxFileSize < Test::Unit::TestCase
   def test_safe_get_accepts_max_body_bytes_as_second_argument
     with_raw_http_response("HTTP/1.1 200 OK\r\nContent-Length: 64\r\n\r\n#{'x' * 64}") do |url|
       assert_body_limit_error do
-        Curl.safe_get(url, :max_body_bytes => 10)
+        Curl.safe_get(url, :max_body_bytes => 10) { |easy| stub_public_network_policy_for_local_fixture(easy) }
       end
     end
   end
@@ -50,6 +50,7 @@ class TestCurbCurlMaxFileSize < Test::Unit::TestCase
     with_raw_http_response("HTTP/1.1 200 OK\r\nContent-Length: 64\r\n\r\n#{'x' * 64}") do |url|
       assert_body_limit_error do
         Curl.safe_get(url, {}, :max_body_bytes => 10) do |easy|
+          stub_public_network_policy_for_local_fixture(easy)
           easy.max_body_bytes = nil
         end
       end
@@ -91,7 +92,7 @@ class TestCurbCurlMaxFileSize < Test::Unit::TestCase
       end
 
       assert_body_limit_error do
-        Curl.safe_get(url, :max_body_bytes => 10)
+        Curl.safe_get(url, :max_body_bytes => 10) { |easy| stub_public_network_policy_for_local_fixture(easy) }
       end
     end
   end
@@ -106,7 +107,7 @@ class TestCurbCurlMaxFileSize < Test::Unit::TestCase
 
   def test_safe_head_does_not_apply_body_cap_to_content_length
     with_raw_http_response("HTTP/1.1 200 OK\r\nContent-Length: 65536\r\n\r\n") do |url|
-      easy = Curl.safe_head(url, :max_body_bytes => 1)
+      easy = Curl.safe_head(url, :max_body_bytes => 1) { |handle| stub_public_network_policy_for_local_fixture(handle) }
 
       assert_equal 200, easy.response_code
       assert_equal '', easy.body_str
@@ -181,6 +182,14 @@ class TestCurbCurlMaxFileSize < Test::Unit::TestCase
   end
 
   private
+
+  # Keep body-limit integration tests local; real destination enforcement is
+  # covered separately in tc_curl_network_policy.rb.
+  def stub_public_network_policy_for_local_fixture(easy)
+    def easy.network_policy=(policy)
+      raise "unexpected policy: #{policy}" unless policy == :public
+    end
+  end
 
   def assert_body_limit_error
     assert_raise(Curl::Err::FileSizeExceededError) do

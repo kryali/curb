@@ -226,8 +226,16 @@ Curl.safe! do |config|
 end
 ```
 
-For local per-handle policy instead of process-wide policy, use
-`easy.safe_http!` and `easy.max_body_bytes = ...` before `perform`.
+For local per-handle policy, use `easy.safe_http!` before `perform`, or use
+`Curl.safe_get`, `Curl.safe_post`, and the other `safe_*` helpers. These enforce
+HTTP/HTTPS for requests and redirects and enable `network_policy = :public`,
+even when the global policy permits private destinations. This rejects local
+services as well as private and link-local addresses, including metadata endpoints.
+The proxy and destination-override controls below apply, with any explicit
+exceptions from `Curl.safe!` honored. Unsupported libcurl builds fail closed.
+Response size remains unlimited unless you set `easy.max_body_bytes = ...` or
+pass a limit, for example `Curl.safe_get(user_url, :max_body_bytes => 1_000_000)`.
+For trusted local services, use the raw helpers with explicit protocol limits.
 
 With `network_policy = :public`, curb checks peer addresses when libcurl opens
 the socket and blocks local/private destinations. Proxies, `resolve`,
