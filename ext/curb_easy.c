@@ -12,9 +12,27 @@
 #include "curb_share.h"
 
 #include <errno.h>
+#include <stdlib.h>
 #include <string.h>
 #ifndef _WIN32
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#else
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#endif
+#ifndef _WIN32
 #include <strings.h>
+#endif
+
+#if defined(HAVE_CURLOPT_OPENSOCKETFUNCTION) && defined(HAVE_CURLOPT_OPENSOCKETDATA)
+#define CURB_HAVE_OPENSOCKET_NETWORK_POLICY 1
+#endif
+
+#if defined(HAVE_CURLOPT_PREREQFUNCTION) && defined(HAVE_CURLOPT_PREREQDATA)
+#define CURB_HAVE_PREREQ_HOST_POLICY 1
 #endif
 
 extern VALUE mCurl;
@@ -22,6 +40,8 @@ extern VALUE mCurl;
 static VALUE idCall;
 static VALUE idJoin;
 static VALUE rbstrAmp;
+static ID idNetworkPolicyNone;
+static ID idNetworkPolicyPublic;
 
 #ifdef RDOC_NEVER_DEFINED
   mCurl = rb_define_module("Curl");
@@ -45,8 +65,659 @@ static FILE * rb_io_stdio_file(rb_io_t *fptr) {
 #endif
 static struct curl_slist *duplicate_curl_slist(struct curl_slist *list);
 static size_t proc_data_handler(char *stream, size_t size, size_t nmemb, VALUE proc);
+static int curb_array_includes_string(VALUE list, VALUE value);
+
+static void curb_easy_apply_thread_defaults(ruby_curl_easy *rbce) {
+#ifdef HAVE_CURLOPT_NOSIGNAL
+  CURLcode ecode = curl_easy_setopt(rbce->curl, CURLOPT_NOSIGNAL, 1L);
+  if (ecode != CURLE_OK) {
+    raise_curl_easy_error_exception(ecode);
+  }
+#else
+  (void)rbce;
+#endif
+}
 
 /* ================== CURL HANDLER FUNCS ==============*/
+
+static int curb_ipv4_is_unsafe_destination(const unsigned char *ip) {
+  if (ip[0] == 0) return 1;                                /* 0.0.0.0/8 */
+  if (ip[0] == 10) return 1;                               /* RFC1918 */
+  if (ip[0] == 100 && (ip[1] & 0xc0) == 0x40) return 1;    /* 100.64.0.0/10 */
+  if (ip[0] == 100 && ip[1] == 100 && ip[2] == 100 && ip[3] == 200) return 1;
+  if (ip[0] == 127) return 1;                              /* loopback */
+  if (ip[0] == 169 && ip[1] == 254) return 1;              /* link-local / metadata */
+  if (ip[0] == 172 && ip[1] >= 16 && ip[1] <= 31) return 1;/* RFC1918 */
+  if (ip[0] == 192 && ip[1] == 168) return 1;              /* RFC1918 */
+  if (ip[0] == 192 && ip[1] == 0 && ip[2] == 0) return 1;  /* IETF protocol assignments */
+  if (ip[0] == 192 && ip[1] == 0 && ip[2] == 2) return 1;  /* TEST-NET-1 */
+  if (ip[0] == 198 && (ip[1] == 18 || ip[1] == 19)) return 1;
+  if (ip[0] == 198 && ip[1] == 51 && ip[2] == 100) return 1;
+  if (ip[0] == 203 && ip[1] == 0 && ip[2] == 113) return 1;
+  if (ip[0] >= 224) return 1;                              /* multicast/reserved */
+
+  return 0;
+}
+
+static int curb_ip_prefix_matches(const unsigned char *ip, const unsigned char *prefix, int bits) {
+  int full_bytes = bits / 8;
+  int remaining_bits = bits % 8;
+  int i;
+
+  for (i = 0; i < full_bytes; i++) {
+    if (ip[i] != prefix[i]) return 0;
+  }
+
+  if (remaining_bits) {
+    unsigned char mask = (unsigned char)(0xff << (8 - remaining_bits));
+    if ((ip[full_bytes] & mask) != (prefix[full_bytes] & mask)) return 0;
+  }
+
+  return 1;
+}
+
+static int curb_ipv6_prefix_matches(const unsigned char *ip, const unsigned char *prefix, int bits) {
+  return curb_ip_prefix_matches(ip, prefix, bits);
+}
+
+static int curb_ipv6_is_all_zero(const unsigned char *ip) {
+  int i;
+
+  for (i = 0; i < 16; i++) {
+    if (ip[i] != 0) return 0;
+  }
+
+  return 1;
+}
+
+static int curb_ipv6_is_ipv4_mapped(const unsigned char *ip) {
+  static const unsigned char prefix[12] = {
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff
+  };
+
+  return curb_ipv6_prefix_matches(ip, prefix, 96);
+}
+
+static int curb_ipv6_is_ipv4_compatible(const unsigned char *ip) {
+  static const unsigned char prefix[12] = {
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
+  };
+
+  return curb_ipv6_prefix_matches(ip, prefix, 96);
+}
+
+static int curb_ipv6_is_nat64_well_known(const unsigned char *ip) {
+  static const unsigned char prefix[12] = {
+    0x00, 0x64, 0xff, 0x9b, 0, 0, 0, 0, 0, 0, 0, 0
+  };
+
+  return curb_ipv6_prefix_matches(ip, prefix, 96);
+}
+
+static int curb_ipv6_is_nat64_local_use(const unsigned char *ip) {
+  static const unsigned char prefix[6] = {
+    0x00, 0x64, 0xff, 0x9b, 0x00, 0x01
+  };
+
+  return curb_ipv6_prefix_matches(ip, prefix, 48);
+}
+
+static int curb_ipv6_is_unsafe_destination(const unsigned char *ip) {
+  static const unsigned char documentation_prefix[4] = { 0x20, 0x01, 0x0d, 0xb8 };
+  static const unsigned char benchmarking_prefix[6] = { 0x20, 0x01, 0x00, 0x02, 0, 0 };
+
+  if (curb_ipv6_is_all_zero(ip)) return 1;                 /* ::/128 */
+  if (curb_ipv6_is_ipv4_mapped(ip)) return curb_ipv4_is_unsafe_destination(ip + 12);
+  if (curb_ipv6_is_nat64_well_known(ip)) return curb_ipv4_is_unsafe_destination(ip + 12);
+  if (curb_ipv6_is_nat64_local_use(ip)) return 1;
+  if (curb_ipv6_is_ipv4_compatible(ip)) return 1;          /* deprecated non-public space */
+  if (ip[0] == 0 && ip[1] == 0 && ip[14] == 0 && ip[15] == 1) return 1;
+  if ((ip[0] & 0xfe) == 0xfc) return 1;                    /* fc00::/7 */
+  if (ip[0] == 0xfe && (ip[1] & 0xc0) == 0x80) return 1;   /* fe80::/10 */
+  if (ip[0] == 0xfe && (ip[1] & 0xc0) == 0xc0) return 1;   /* fec0::/10 */
+  if (ip[0] == 0xff) return 1;                             /* multicast */
+  if (curb_ipv6_prefix_matches(ip, documentation_prefix, 32)) return 1;
+  if (curb_ipv6_prefix_matches(ip, benchmarking_prefix, 48)) return 1;
+  if (ip[0] == 0x20 && ip[1] == 0x02) return 1;            /* 2002::/16 */
+
+  return 0;
+}
+
+static void curb_clear_network_allowed_cidr_rules(ruby_curl_easy *rbce) {
+  if (!rbce || !rbce->network_allowed_cidr_rules) return;
+
+  xfree(rbce->network_allowed_cidr_rules);
+  rbce->network_allowed_cidr_rules = NULL;
+  rbce->network_allowed_cidr_rule_count = 0;
+}
+
+static void curb_raise_invalid_cidr(char *tmp, const char *cidr) {
+  if (tmp) xfree(tmp);
+  rb_raise(rb_eArgError, "invalid CIDR range: %s", cidr);
+}
+
+static void curb_parse_cidr_rule(const char *cidr, curb_cidr_rule *rule) {
+  size_t len;
+  char *tmp;
+  char *address;
+  char *prefix_str = NULL;
+  char *slash;
+  long prefix = -1;
+  int max_prefix = 0;
+  unsigned char parsed[16];
+
+  if (!cidr || !rule) {
+    rb_raise(rb_eArgError, "invalid CIDR range");
+  }
+
+  len = strlen(cidr);
+  if (len == 0) {
+    rb_raise(rb_eArgError, "invalid CIDR range: %s", cidr);
+  }
+
+  tmp = ALLOC_N(char, len + 1);
+  memcpy(tmp, cidr, len + 1);
+  address = tmp;
+
+  if (address[0] == '[') {
+    char *closing = strchr(address, ']');
+    if (!closing) curb_raise_invalid_cidr(tmp, cidr);
+
+    *closing = '\0';
+    address++;
+
+    if (closing[1] == '/') {
+      prefix_str = closing + 2;
+    } else if (closing[1] != '\0') {
+      curb_raise_invalid_cidr(tmp, cidr);
+    }
+  } else {
+    slash = strchr(address, '/');
+    if (slash) {
+      *slash = '\0';
+      prefix_str = slash + 1;
+    }
+  }
+
+  memset(rule, 0, sizeof(curb_cidr_rule));
+
+  if (inet_pton(AF_INET, address, parsed) == 1) {
+    rule->family = CURB_CIDR_FAMILY_IPV4;
+    max_prefix = 32;
+    memcpy(rule->address, parsed, 4);
+  } else if (inet_pton(AF_INET6, address, parsed) == 1) {
+    rule->family = CURB_CIDR_FAMILY_IPV6;
+    max_prefix = 128;
+    memcpy(rule->address, parsed, 16);
+  } else {
+    curb_raise_invalid_cidr(tmp, cidr);
+  }
+
+  if (prefix_str) {
+    char *endptr = NULL;
+
+    if (prefix_str[0] == '\0') curb_raise_invalid_cidr(tmp, cidr);
+
+    errno = 0;
+    prefix = strtol(prefix_str, &endptr, 10);
+    if (errno != 0 || !endptr || *endptr != '\0' || prefix < 0 || prefix > max_prefix) {
+      curb_raise_invalid_cidr(tmp, cidr);
+    }
+  } else {
+    prefix = max_prefix;
+  }
+
+  rule->prefix_bits = (unsigned char)prefix;
+  xfree(tmp);
+}
+
+static VALUE curb_normalize_cidr_list(VALUE cidrs) {
+  VALUE list;
+  VALUE normalized;
+  long i;
+
+  if (NIL_P(cidrs)) return Qnil;
+
+  list = rb_check_array_type(cidrs);
+  if (NIL_P(list)) {
+    list = rb_ary_new_from_args(1, cidrs);
+  }
+
+  normalized = rb_ary_new_capa(RARRAY_LEN(list));
+  for (i = 0; i < RARRAY_LEN(list); i++) {
+    VALUE item = rb_ary_entry(list, i);
+    VALUE cidr = rb_obj_as_string(item);
+    curb_cidr_rule unused_rule;
+
+    curb_parse_cidr_rule(StringValueCStr(cidr), &unused_rule);
+    if (!curb_array_includes_string(normalized, cidr)) {
+      rb_ary_push(normalized, rb_str_dup(cidr));
+    }
+  }
+
+  return normalized;
+}
+
+static VALUE curb_dup_string_array(VALUE list) {
+  VALUE copy;
+  long i;
+
+  if (NIL_P(list)) return Qnil;
+
+  copy = rb_ary_new_capa(RARRAY_LEN(list));
+  for (i = 0; i < RARRAY_LEN(list); i++) {
+    rb_ary_push(copy, rb_str_dup(rb_ary_entry(list, i)));
+  }
+
+  return copy;
+}
+
+static int curb_array_includes_string(VALUE list, VALUE value) {
+  long i;
+
+  for (i = 0; i < RARRAY_LEN(list); i++) {
+    if (rb_str_cmp(rb_ary_entry(list, i), value) == 0) return 1;
+  }
+
+  return 0;
+}
+
+static char curb_ascii_downcase(char c) {
+  if (c >= 'A' && c <= 'Z') return (char)(c - 'A' + 'a');
+  return c;
+}
+
+static char *curb_normalized_host_from_range(const char *start, const char *end, int raise_errors) {
+  char *host;
+  size_t len;
+  size_t i;
+
+  while (start < end && (*start == ' ' || *start == '\t' || *start == '\r' || *start == '\n')) start++;
+  while (end > start && (end[-1] == ' ' || end[-1] == '\t' || end[-1] == '\r' || end[-1] == '\n')) end--;
+  while (end > start && end[-1] == '.') end--;
+
+  if (end <= start) {
+    if (!raise_errors) return NULL;
+    rb_raise(rb_eArgError, "allowed_hosts cannot include blank entries");
+  }
+
+  len = (size_t)(end - start);
+  host = ALLOC_N(char, len + 1);
+  for (i = 0; i < len; i++) {
+    host[i] = curb_ascii_downcase(start[i]);
+  }
+  host[len] = '\0';
+
+  return host;
+}
+
+static char *curb_normalize_host_value_impl(const char *value, int raise_errors) {
+  const char *start;
+  const char *end;
+  const char *scheme;
+  const char *authority_end;
+  const char *scan;
+  const char *last_at = NULL;
+  int colon_count = 0;
+
+  if (!value) {
+    if (!raise_errors) return NULL;
+    rb_raise(rb_eArgError, "allowed_hosts cannot include blank entries");
+  }
+
+  start = value;
+  end = value + strlen(value);
+  while (start < end && (*start == ' ' || *start == '\t' || *start == '\r' || *start == '\n')) start++;
+  while (end > start && (end[-1] == ' ' || end[-1] == '\t' || end[-1] == '\r' || end[-1] == '\n')) end--;
+  if (end <= start) {
+    if (!raise_errors) return NULL;
+    rb_raise(rb_eArgError, "allowed_hosts cannot include blank entries");
+  }
+
+  scheme = strstr(start, "://");
+  if (scheme && scheme < end) {
+    start = scheme + 3;
+  }
+
+  authority_end = end;
+  for (scan = start; scan < end; scan++) {
+    if (*scan == '/' || *scan == '?' || *scan == '#') {
+      authority_end = scan;
+      break;
+    }
+  }
+
+  for (scan = start; scan < authority_end; scan++) {
+    if (*scan == '@') last_at = scan;
+  }
+  if (last_at) start = last_at + 1;
+
+  if (start < authority_end && *start == '[') {
+    const char *closing = start + 1;
+    while (closing < authority_end && *closing != ']') closing++;
+    if (closing >= authority_end) {
+      if (!raise_errors) return NULL;
+      rb_raise(rb_eArgError, "invalid allowed host: %s", value);
+    }
+    return curb_normalized_host_from_range(start + 1, closing, raise_errors);
+  }
+
+  for (scan = start; scan < authority_end; scan++) {
+    if (*scan == ':') colon_count++;
+  }
+
+  if (colon_count <= 1) {
+    for (scan = start; scan < authority_end; scan++) {
+      if (*scan == ':') {
+        authority_end = scan;
+        break;
+      }
+    }
+  }
+
+  return curb_normalized_host_from_range(start, authority_end, raise_errors);
+}
+
+static char *curb_normalize_host_value(const char *value) {
+  return curb_normalize_host_value_impl(value, 1);
+}
+
+static char *curb_try_normalize_host_value(const char *value) {
+  return curb_normalize_host_value_impl(value, 0);
+}
+
+static VALUE curb_normalize_host_list(VALUE hosts) {
+  VALUE list;
+  VALUE normalized;
+  long i;
+
+  if (NIL_P(hosts)) return Qnil;
+
+  list = rb_check_array_type(hosts);
+  if (NIL_P(list)) {
+    list = rb_ary_new_from_args(1, hosts);
+  }
+
+  normalized = rb_ary_new_capa(RARRAY_LEN(list));
+  for (i = 0; i < RARRAY_LEN(list); i++) {
+    VALUE item = rb_ary_entry(list, i);
+    VALUE host_value = rb_obj_as_string(item);
+    char *host = curb_normalize_host_value(StringValueCStr(host_value));
+    VALUE normalized_host = rb_str_new_cstr(host);
+
+    if (!curb_array_includes_string(normalized, normalized_host)) {
+      rb_ary_push(normalized, normalized_host);
+    }
+    xfree(host);
+  }
+
+  return normalized;
+}
+
+static void curb_clear_network_allowed_hosts(ruby_curl_easy *rbce) {
+  size_t i;
+
+  if (!rbce || !rbce->network_allowed_hosts) return;
+
+  for (i = 0; i < rbce->network_allowed_host_count; i++) {
+    if (rbce->network_allowed_hosts[i]) xfree(rbce->network_allowed_hosts[i]);
+  }
+  xfree(rbce->network_allowed_hosts);
+  rbce->network_allowed_hosts = NULL;
+  rbce->network_allowed_host_count = 0;
+}
+
+static char *curb_strdup_cstr(const char *value) {
+  size_t len = strlen(value);
+  char *copy = ALLOC_N(char, len + 1);
+  memcpy(copy, value, len + 1);
+  return copy;
+}
+
+static void curb_prepare_network_allowed_hosts(ruby_curl_easy *rbce) {
+  VALUE hosts;
+  long count;
+  long i;
+  char **rules;
+
+  if (!rbce) return;
+
+  curb_clear_network_allowed_hosts(rbce);
+
+  hosts = rb_hash_aref(rbce->opts, rb_easy_hkey("allowed_hosts"));
+  if (NIL_P(hosts)) return;
+
+  count = RARRAY_LEN(hosts);
+  if (count <= 0) return;
+
+  rules = ALLOC_N(char *, count);
+  for (i = 0; i < count; i++) {
+    VALUE host = rb_ary_entry(hosts, i);
+    rules[i] = curb_strdup_cstr(StringValueCStr(host));
+  }
+
+  rbce->network_allowed_hosts = rules;
+  rbce->network_allowed_host_count = (size_t)count;
+}
+
+static int curb_host_rules_match(const ruby_curl_easy *rbce, const char *host) {
+  size_t i;
+
+  if (!rbce || rbce->network_allowed_host_count == 0) return 1;
+
+  for (i = 0; i < rbce->network_allowed_host_count; i++) {
+    if (strcmp(host, rbce->network_allowed_hosts[i]) == 0) return 1;
+  }
+
+  return 0;
+}
+
+static void curb_prepare_network_allowed_cidr_rules(ruby_curl_easy *rbce) {
+  VALUE cidrs;
+  long count;
+  long i;
+  curb_cidr_rule *rules;
+
+  if (!rbce) return;
+
+  curb_clear_network_allowed_cidr_rules(rbce);
+
+  cidrs = rb_hash_aref(rbce->opts, rb_easy_hkey("allowed_cidrs"));
+  if (NIL_P(cidrs)) return;
+
+  count = RARRAY_LEN(cidrs);
+  if (count <= 0) return;
+
+  rules = ALLOC_N(curb_cidr_rule, count);
+  for (i = 0; i < count; i++) {
+    VALUE cidr = rb_ary_entry(cidrs, i);
+    curb_parse_cidr_rule(StringValueCStr(cidr), &rules[i]);
+  }
+
+  rbce->network_allowed_cidr_rules = rules;
+  rbce->network_allowed_cidr_rule_count = (size_t)count;
+}
+
+static int curb_cidr_rules_match(const ruby_curl_easy *rbce, unsigned char family, const unsigned char *ip) {
+  size_t i;
+
+  if (!rbce || rbce->network_allowed_cidr_rule_count == 0) return 1;
+
+  for (i = 0; i < rbce->network_allowed_cidr_rule_count; i++) {
+    const curb_cidr_rule *rule = &rbce->network_allowed_cidr_rules[i];
+    if (rule->family != family) continue;
+    if (curb_ip_prefix_matches(ip, rule->address, rule->prefix_bits)) return 1;
+  }
+
+  return 0;
+}
+
+static void curb_format_ipv4(char *buf, size_t len, const unsigned char *ip) {
+  snprintf(buf, len, "%u.%u.%u.%u",
+           (unsigned int)ip[0], (unsigned int)ip[1],
+           (unsigned int)ip[2], (unsigned int)ip[3]);
+}
+
+static void curb_format_ipv6(char *buf, size_t len, const unsigned char *ip) {
+#ifdef AF_INET6
+#ifdef _WIN32
+  if (inet_ntop(AF_INET6, (void *)ip, buf, len)) return;
+#else
+  if (inet_ntop(AF_INET6, (const void *)ip, buf, (socklen_t)len)) return;
+#endif
+#endif
+
+  snprintf(buf, len,
+           "%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x",
+           (unsigned int)ip[0], (unsigned int)ip[1],
+           (unsigned int)ip[2], (unsigned int)ip[3],
+           (unsigned int)ip[4], (unsigned int)ip[5],
+           (unsigned int)ip[6], (unsigned int)ip[7],
+           (unsigned int)ip[8], (unsigned int)ip[9],
+           (unsigned int)ip[10], (unsigned int)ip[11],
+           (unsigned int)ip[12], (unsigned int)ip[13],
+           (unsigned int)ip[14], (unsigned int)ip[15]);
+}
+
+static void curb_store_destination_error(ruby_curl_easy *rbce, const char *address, const char *reason) {
+  if (!rbce) return;
+
+  rbce->unsafe_destination_blocked = 1;
+
+  if (reason && reason[0]) {
+    snprintf(rbce->unsafe_destination_error, CURL_ERROR_SIZE,
+             "blocked destination address %s %s by public network policy", address, reason);
+  } else {
+    snprintf(rbce->unsafe_destination_error, CURL_ERROR_SIZE,
+             "blocked unsafe destination address %s by public network policy", address);
+  }
+
+  snprintf(rbce->err_buf, CURL_ERROR_SIZE, "%s", rbce->unsafe_destination_error);
+}
+
+static void curb_store_unsafe_destination_error(ruby_curl_easy *rbce, const char *address) {
+  curb_store_destination_error(rbce, address, NULL);
+}
+
+static void curb_store_host_allowlist_error(ruby_curl_easy *rbce, const char *host) {
+  if (!rbce) return;
+
+  rbce->unsafe_destination_blocked = 1;
+  snprintf(rbce->unsafe_destination_error, CURL_ERROR_SIZE,
+           "blocked URL host %s by safe mode host allowlist", host ? host : "unknown");
+  snprintf(rbce->err_buf, CURL_ERROR_SIZE, "%s", rbce->unsafe_destination_error);
+}
+
+#ifdef CURB_HAVE_PREREQ_HOST_POLICY
+static int curb_host_allowlist_prereq(void *clientp,
+                                      char *conn_primary_ip,
+                                      char *conn_local_ip,
+                                      int conn_primary_port,
+                                      int conn_local_port) {
+  ruby_curl_easy *rbce = (ruby_curl_easy *)clientp;
+  char *effective_url = NULL;
+  char *host = NULL;
+  CURLcode rc;
+
+  (void)conn_primary_ip;
+  (void)conn_local_ip;
+  (void)conn_primary_port;
+  (void)conn_local_port;
+
+  if (!rbce || rbce->network_allowed_host_count == 0) {
+    return CURL_PREREQFUNC_OK;
+  }
+
+  rc = curl_easy_getinfo(rbce->curl, CURLINFO_EFFECTIVE_URL, &effective_url);
+  if (rc != CURLE_OK || !effective_url) {
+    curb_store_host_allowlist_error(rbce, "unknown");
+    return CURL_PREREQFUNC_ABORT;
+  }
+
+  host = curb_try_normalize_host_value(effective_url);
+  if (!host) {
+    curb_store_host_allowlist_error(rbce, "unknown");
+    return CURL_PREREQFUNC_ABORT;
+  }
+
+  if (!curb_host_rules_match(rbce, host)) {
+    curb_store_host_allowlist_error(rbce, host);
+    xfree(host);
+    return CURL_PREREQFUNC_ABORT;
+  }
+
+  xfree(host);
+  return CURL_PREREQFUNC_OK;
+}
+#endif
+
+#ifdef CURB_HAVE_OPENSOCKET_NETWORK_POLICY
+static curl_socket_t curb_public_network_opensocket(void *clientp, curlsocktype purpose, struct curl_sockaddr *address) {
+  ruby_curl_easy *rbce = (ruby_curl_easy *)clientp;
+  curl_socket_t sockfd;
+  char address_string[80];
+  int checked_destination_address = 0;
+
+  (void)purpose;
+
+  if (!address) {
+    curb_store_unsafe_destination_error(rbce, "unknown");
+    return CURL_SOCKET_BAD;
+  }
+
+#ifdef AF_INET
+  if (address->family == AF_INET && address->addrlen >= sizeof(struct sockaddr_in)) {
+    const struct sockaddr_in *sin = (const struct sockaddr_in *)&address->addr;
+    const unsigned char *ip = (const unsigned char *)&sin->sin_addr;
+    checked_destination_address = 1;
+
+    if (curb_ipv4_is_unsafe_destination(ip)) {
+      curb_format_ipv4(address_string, sizeof(address_string), ip);
+      curb_store_unsafe_destination_error(rbce, address_string);
+      return CURL_SOCKET_BAD;
+    }
+
+    if (!curb_cidr_rules_match(rbce, CURB_CIDR_FAMILY_IPV4, ip)) {
+      curb_format_ipv4(address_string, sizeof(address_string), ip);
+      curb_store_destination_error(rbce, address_string, "outside allowed CIDR ranges");
+      return CURL_SOCKET_BAD;
+    }
+  }
+#endif
+
+#ifdef AF_INET6
+  if (address->family == AF_INET6 && address->addrlen >= sizeof(struct sockaddr_in6)) {
+    const struct sockaddr_in6 *sin6 = (const struct sockaddr_in6 *)&address->addr;
+    const unsigned char *ip = (const unsigned char *)&sin6->sin6_addr;
+    checked_destination_address = 1;
+
+    if (curb_ipv6_is_unsafe_destination(ip)) {
+      curb_format_ipv6(address_string, sizeof(address_string), ip);
+      curb_store_unsafe_destination_error(rbce, address_string);
+      return CURL_SOCKET_BAD;
+    }
+
+    if (!curb_cidr_rules_match(rbce, CURB_CIDR_FAMILY_IPV6, ip)) {
+      curb_format_ipv6(address_string, sizeof(address_string), ip);
+      curb_store_destination_error(rbce, address_string, "outside allowed CIDR ranges");
+      return CURL_SOCKET_BAD;
+    }
+  }
+#endif
+
+  if (!checked_destination_address && rbce && rbce->network_allowed_cidr_rule_count > 0) {
+    curb_store_destination_error(rbce, "unknown", "outside allowed CIDR ranges");
+    return CURL_SOCKET_BAD;
+  }
+
+  sockfd = socket(address->family, address->socktype, address->protocol);
+  if (sockfd == CURL_SOCKET_BAD) {
+    return CURL_SOCKET_BAD;
+  }
+
+  return sockfd;
+}
+#endif
 
 static VALUE callback_exception(VALUE unused, VALUE exception) {
   return Qfalse;
@@ -77,7 +748,7 @@ VALUE rb_curl_easy_take_callback_error(ruby_curl_easy *rbce) {
 static VALUE ruby_curl_easy_take_callback_error(VALUE self) {
   ruby_curl_easy *rbce = NULL;
 
-  TypedData_Get_Struct(self, ruby_curl_easy, &ruby_curl_easy_data_type, rbce);
+  rbce = ruby_curl_easy_get_handle(self);
   return rb_curl_easy_take_callback_error(rbce);
 }
 
@@ -94,6 +765,20 @@ static VALUE with_easy_callback_active(ruby_curl_easy *rbce, VALUE (*func)(VALUE
   return rb_ensure(func, arg, ensure_clear_easy_callback_active, (VALUE)rbce);
 }
 
+static void ruby_curl_easy_enter_native(ruby_curl_easy *rbce) {
+  if (rbce) {
+    rbce->native_active++;
+  }
+}
+
+static VALUE ruby_curl_easy_leave_native(VALUE arg) {
+  ruby_curl_easy *rbce = (ruby_curl_easy *)arg;
+  if (rbce && rbce->native_active > 0) {
+    rbce->native_active--;
+  }
+  return Qnil;
+}
+
 struct stream_read_call_args {
   VALUE stream;
   size_t read_bytes;
@@ -106,6 +791,11 @@ static VALUE call_stream_read(VALUE argp) {
 
 static VALUE call_stream_to_s(VALUE stream) {
   return rb_funcall(stream, rb_intern("to_s"), 0);
+}
+
+static VALUE call_string_value(VALUE str) {
+  StringValue(str);
+  return str;
 }
 
 struct stream_seek_call_args {
@@ -142,6 +832,54 @@ static VALUE call_with_easy_callback_active(VALUE argp) {
   return with_easy_callback_active(args->rbce, args->func, args->arg);
 }
 
+static VALUE rescue_easy_callback(ruby_curl_easy *rbce, VALUE (*func)(VALUE), VALUE arg) {
+  struct easy_callback_dispatch_args dispatch_args;
+  dispatch_args.rbce = rbce;
+  dispatch_args.func = func;
+  dispatch_args.arg = arg;
+  return rb_rescue(call_with_easy_callback_active, (VALUE)&dispatch_args, callback_exception_store_on_easy, (VALUE)rbce);
+}
+
+static size_t curl_read_abort_result(void) {
+#ifdef CURL_READFUNC_ABORT
+  return CURL_READFUNC_ABORT;
+#else
+  return 0;
+#endif
+}
+
+static int curl_seek_fail_result(void) {
+#ifdef CURL_SEEKFUNC_FAIL
+  return CURL_SEEKFUNC_FAIL;
+#else
+  return 1;
+#endif
+}
+
+static int ruby_curl_easy_body_limit_exceeded(ruby_curl_easy *rbce, size_t total) {
+  VALUE max_body_bytes = rb_easy_get("max_body_bytes");
+  curl_off_t limit;
+
+  if (NIL_P(max_body_bytes)) {
+    return 0;
+  }
+
+  limit = (curl_off_t)NUM2LL(max_body_bytes);
+  if (limit <= 0) {
+    return 0;
+  }
+
+  if ((curl_off_t)total > limit - rbce->downloaded_body_bytes) {
+    if (NIL_P(rbce->callback_error)) {
+      rbce->callback_error = rb_exc_new_cstr(eCurlErrFileSizeExceeded, "Maximum body size exceeded");
+    }
+    return 1;
+  }
+
+  rbce->downloaded_body_bytes += (curl_off_t)total;
+  return 0;
+}
+
 /* Default body handler appends to easy.body_data buffer */
 static size_t default_body_handler(char *stream,
                                    size_t size,
@@ -150,6 +888,11 @@ static size_t default_body_handler(char *stream,
   ruby_curl_easy *rbce = (ruby_curl_easy *)userdata;
   size_t total = size * nmemb;
   VALUE out = rb_easy_get("body_data");
+
+  if (ruby_curl_easy_body_limit_exceeded(rbce, total)) {
+    return 0;
+  }
+
   if (NIL_P(out)) {
     out = rb_easy_set("body_data", rb_str_buf_new(32768));
   }
@@ -179,18 +922,36 @@ static size_t read_data_handler(void *ptr,
                                 ruby_curl_easy *rbce) {
   VALUE upload = rb_easy_get("upload");
   size_t read_bytes = (size*nmemb);
-  VALUE stream = ruby_curl_upload_stream_get(upload);
+  VALUE stream;
+
+  if (NIL_P(upload)) {
+    return curl_read_abort_result();
+  }
+
+  stream = ruby_curl_upload_stream_get(upload);
 
   if (rb_respond_to(stream, rb_intern("read"))) {//if (rb_respond_to(stream, rb_intern("to_s"))) {
     /* copy read_bytes from stream into ptr */
     struct stream_read_call_args args;
     args.stream = stream;
     args.read_bytes = read_bytes;
-    VALUE str = with_easy_callback_active(rbce, call_stream_read, (VALUE)&args);
+    VALUE str = rescue_easy_callback(rbce, call_stream_read, (VALUE)&args);
     if( str != Qnil ) {
-      StringValue(str);
-      memcpy(ptr, RSTRING_PTR(str), RSTRING_LEN(str));
-      return RSTRING_LEN(str);
+      size_t str_len;
+
+      str = rescue_easy_callback(rbce, call_string_value, str);
+      if (str == Qfalse || str == Qnil) {
+        return curl_read_abort_result();
+      }
+
+      str_len = (size_t)RSTRING_LEN(str);
+      if (str_len > read_bytes) {
+        snprintf(rbce->err_buf, CURL_ERROR_SIZE, "read callback returned more data than requested");
+        return curl_read_abort_result();
+      }
+
+      memcpy(ptr, RSTRING_PTR(str), str_len);
+      return str_len;
     }
     else {
       return 0;
@@ -203,9 +964,17 @@ static size_t read_data_handler(void *ptr,
     size_t remaining;
     char *str_ptr;
     TypedData_Get_Struct(upload, ruby_curl_upload, &ruby_curl_upload_data_type, rbcu);
-    str = with_easy_callback_active(rbce, call_stream_to_s, stream);
-    StringValue(str);
+    str = rescue_easy_callback(rbce, call_stream_to_s, stream);
+    str = rescue_easy_callback(rbce, call_string_value, str);
+    if (str == Qfalse || str == Qnil) {
+      return curl_read_abort_result();
+    }
+
     len = RSTRING_LEN(str);
+    if (rbcu->offset >= len) {
+      return 0;
+    }
+
     remaining = len - rbcu->offset;
     str_ptr = RSTRING_PTR(str);
 
@@ -233,14 +1002,23 @@ int seek_data_handler(ruby_curl_easy *rbce,
                       int origin) {
 
   VALUE upload = rb_easy_get("upload");
-  VALUE stream = ruby_curl_upload_stream_get(upload);
+  VALUE stream;
+
+  if (NIL_P(upload)) {
+    return curl_seek_fail_result();
+  }
+
+  stream = ruby_curl_upload_stream_get(upload);
 
   if (rb_respond_to(stream, rb_intern("seek"))) {
     struct stream_seek_call_args args;
     args.stream = stream;
     args.offset = offset;
-    args.origin = SEEK_SET;
-    with_easy_callback_active(rbce, call_stream_seek, (VALUE)&args);
+    args.origin = origin;
+    rescue_easy_callback(rbce, call_stream_seek, (VALUE)&args);
+    if (!NIL_P(rbce->callback_error)) {
+      return curl_seek_fail_result();
+    }
   } else {
     ruby_curl_upload *rbcu;
     TypedData_Get_Struct(upload, ruby_curl_upload, &ruby_curl_upload_data_type, rbcu);
@@ -282,6 +1060,10 @@ static size_t proc_data_handler_body(char *stream,
   args.size = size;
   args.nmemb = nmemb;
   args.proc = rb_easy_get("body_proc");
+
+  if (ruby_curl_easy_body_limit_exceeded(rbce, size * nmemb)) {
+    return 0;
+  }
 
   dispatch_args.rbce = rbce;
   dispatch_args.func = call_proc_data_handler_wrapped;
@@ -417,6 +1199,7 @@ static int proc_debug_handler(CURL *curl,
 static void curl_easy_mark(void *ptr) {
   ruby_curl_easy *rbce = (ruby_curl_easy *)ptr;
   if (rbce) {
+    if (!NIL_P(rbce->self)) { rb_gc_mark(rbce->self); }
     if (!NIL_P(rbce->opts)) { rb_gc_mark(rbce->opts); }
     if (!NIL_P(rbce->multi)) { rb_gc_mark(rbce->multi); }
     if (!NIL_P(rbce->share)) { rb_gc_mark(rbce->share); }
@@ -472,6 +1255,27 @@ static void ruby_curl_easy_clear_resolve_list(ruby_curl_easy *rbce) {
   rbce->curl_resolve = NULL;
 }
 
+static void ruby_curl_easy_clear_connect_to_list(ruby_curl_easy *rbce) {
+  if (!rbce || !rbce->curl_connect_to) {
+    return;
+  }
+#ifdef HAVE_CURLOPT_CONNECT_TO
+  if (rbce->curl) {
+    curl_easy_setopt(rbce->curl, CURLOPT_CONNECT_TO, NULL);
+  }
+#endif
+  curl_slist_free_all(rbce->curl_connect_to);
+  rbce->curl_connect_to = NULL;
+}
+
+static void ruby_curl_easy_clear_setup_lists(ruby_curl_easy *rbce) {
+  ruby_curl_easy_clear_headers_list(rbce);
+  ruby_curl_easy_clear_proxy_headers_list(rbce);
+  ruby_curl_easy_clear_ftp_commands_list(rbce);
+  ruby_curl_easy_clear_resolve_list(rbce);
+  ruby_curl_easy_clear_connect_to_list(rbce);
+}
+
 /* Legacy wrapper for external callers */
 void ruby_curl_easy_mark(ruby_curl_easy *rbce) {
   curl_easy_mark((void *)rbce);
@@ -501,6 +1305,19 @@ static ruby_curl_multi *ruby_curl_multi_pointer_if_compatible(VALUE multi_val) {
 #endif
 }
 
+/* Explicit lifecycle operations can update Ruby bookkeeping; the GC free
+ * path below must remain allocation-free. */
+static void ruby_curl_easy_detach(VALUE self, ruby_curl_easy *rbce) {
+  VALUE multi = rbce->multi;
+  ruby_curl_multi *rbcm = ruby_curl_multi_pointer_if_compatible(multi);
+  if (rbcm) {
+    CURLMcode result = rb_curl_multi_detach_easy(rbcm, rbce);
+    if (result != CURLM_OK) raise_curl_multi_error_exception(result);
+    rb_curl_multi_remove_request_reference(multi, self);
+  }
+  rbce->multi = Qnil;
+}
+
 static void ruby_curl_easy_free(ruby_curl_easy *rbce) {
   if (!rbce) {
     return;
@@ -517,10 +1334,7 @@ static void ruby_curl_easy_free(ruby_curl_easy *rbce) {
        * libcurl retaining a dangling pointer to a soon-to-be cleaned-up easy
        * handle. This path runs during GC, so it must not invoke Ruby APIs that
        * can allocate or raise. */
-      if (rbcm->handle && rbce->curl) {
-        curl_multi_remove_handle(rbcm->handle, rbce->curl);
-      }
-      rb_curl_multi_forget_easy(rbcm, rbce);
+      rb_curl_multi_detach_easy(rbcm, rbce);
     }
   }
 
@@ -528,6 +1342,9 @@ static void ruby_curl_easy_free(ruby_curl_easy *rbce) {
   ruby_curl_easy_clear_proxy_headers_list(rbce);
   ruby_curl_easy_clear_ftp_commands_list(rbce);
   ruby_curl_easy_clear_resolve_list(rbce);
+  ruby_curl_easy_clear_connect_to_list(rbce);
+  curb_clear_network_allowed_cidr_rules(rbce);
+  curb_clear_network_allowed_hosts(rbce);
 
   if (rbce->curl) {
     /* disable any progress or debug events */
@@ -591,18 +1408,57 @@ const rb_data_type_t ruby_curl_easy_data_type = {
 };
 
 
+void ruby_curl_easy_check_access(ruby_curl_easy *rbce) {
+  if (rbce->multipart_building) {
+    rb_raise(rb_eRuntimeError, "Cannot access an active curl handle during multipart construction");
+  }
+  rb_curl_multi_check_easy_thread(rbce);
+}
+
+static void ruby_curl_easy_check_idle(ruby_curl_easy *rbce) {
+  ruby_curl_easy_check_access(rbce);
+  if (rb_curl_multi_easy_performing(rbce)) {
+    rb_raise(rb_eRuntimeError, "Cannot modify an active curl handle during perform");
+  }
+}
+
+/* Public entry points must not pass an uninitialized handle to libcurl. */
+ruby_curl_easy *ruby_curl_easy_get_handle(VALUE self) {
+  ruby_curl_easy *rbce;
+  TypedData_Get_Struct(self, ruby_curl_easy, &ruby_curl_easy_data_type, rbce);
+  if (!rbce->curl) {
+    rb_raise(eCurlErrFailedInit, "Curl::Easy handle is not initialized");
+  }
+  ruby_curl_easy_check_access(rbce);
+  return rbce;
+}
+
+/* Keep libcurl's typed getinfo arguments while checking every result. */
+#define CURB_GETINFO(handle, info, output) do { \
+  CURLcode info_result = curl_easy_getinfo(handle, info, output); \
+  if (info_result != CURLE_OK) { \
+    raise_curl_easy_error_exception(info_result); \
+  } \
+} while (0)
+
 /* ================= ALLOC METHODS ====================*/
 
 static void ruby_curl_easy_zero(ruby_curl_easy *rbce) {
   rbce->opts = rb_hash_new();
 
   memset(rbce->err_buf, 0, CURL_ERROR_SIZE);
+  memset(rbce->unsafe_destination_error, 0, CURL_ERROR_SIZE);
 
   rbce->self = Qnil;
   rbce->curl_headers = NULL;
   rbce->curl_proxy_headers = NULL;
   rbce->curl_ftp_commands = NULL;
   rbce->curl_resolve = NULL;
+  rbce->curl_connect_to = NULL;
+  rbce->network_allowed_cidr_rules = NULL;
+  rbce->network_allowed_hosts = NULL;
+  rbce->network_allowed_cidr_rule_count = 0;
+  rbce->network_allowed_host_count = 0;
 
   /* various-typed opts */
   rbce->local_port = 0;
@@ -627,6 +1483,7 @@ static void ruby_curl_easy_zero(ruby_curl_easy *rbce) {
   rbce->ftp_filemethod = -1;
   rbce->http_version = CURL_HTTP_VERSION_NONE;
   rbce->resolve_mode = CURL_IPRESOLVE_WHATEVER;
+  rbce->network_policy = CURB_NETWORK_POLICY_NONE;
 
   /* bool opts */
   rbce->proxy_tunnel = 0;
@@ -639,10 +1496,18 @@ static void ruby_curl_easy_zero(ruby_curl_easy *rbce) {
   rbce->unrestricted_auth = 0;
   rbce->verbose = 0;
   rbce->multipart_form_post = 0;
+  rbce->multipart_form_active = 0;
+  rbce->multipart_building = 0;
   rbce->enable_cookies = 0;
   rbce->cookielist_engine_enabled = 0;
   rbce->ignore_content_length = 0;
   rbce->callback_active = 0;
+  rbce->unsafe_destination_blocked = 0;
+  rbce->allow_proxy = 0;
+  rbce->allow_unix_socket = 0;
+  rbce->forbid_reuse_set = 0;
+  rbce->native_active = 0;
+  rbce->forbid_reuse = 0;
   rbce->callback_error = Qnil;
   rbce->last_result = 0;
   rbce->share = Qnil;
@@ -684,6 +1549,16 @@ static VALUE ruby_curl_easy_initialize(int argc, VALUE *argv, VALUE self) {
 
   TypedData_Get_Struct(self, ruby_curl_easy, &ruby_curl_easy_data_type, rbce);
 
+  if (rbce->callback_active || rbce->native_active) {
+    rb_raise(rb_eRuntimeError, "Cannot initialize an active curl handle");
+  }
+
+  ruby_curl_easy_check_idle(rbce);
+  ruby_curl_easy_detach(self, rbce);
+
+  /* Detach and release any previous handle and its owned option lists. */
+  ruby_curl_easy_free(rbce);
+
   /* handler */
   rbce->curl = curl_easy_init();
   if (!rbce->curl) {
@@ -696,6 +1571,7 @@ static VALUE ruby_curl_easy_initialize(int argc, VALUE *argv, VALUE self) {
   ruby_curl_easy_zero(rbce);
   rbce->self = self;
 
+  curb_easy_apply_thread_defaults(rbce);
   curl_easy_setopt(rbce->curl, CURLOPT_ERRORBUFFER, &rbce->err_buf);
 
   rb_easy_set("url", url);
@@ -729,6 +1605,24 @@ static struct curl_slist *duplicate_curl_slist(struct curl_slist *list) {
     return dup;
 }
 
+static VALUE duplicate_upload(VALUE upload) {
+  ruby_curl_upload *rbcu, *newrbcu;
+  VALUE new_upload;
+
+  if (NIL_P(upload)) {
+    return Qnil;
+  }
+
+  TypedData_Get_Struct(upload, ruby_curl_upload, &ruby_curl_upload_data_type, rbcu);
+
+  new_upload = ruby_curl_upload_new(cCurlUpload);
+  TypedData_Get_Struct(new_upload, ruby_curl_upload, &ruby_curl_upload_data_type, newrbcu);
+  newrbcu->stream = rbcu->stream;
+  newrbcu->offset = rbcu->offset;
+
+  return new_upload;
+}
+
 /*
  * call-seq:
  *   easy.clone                                       => <easy clone>
@@ -736,11 +1630,13 @@ static struct curl_slist *duplicate_curl_slist(struct curl_slist *list) {
  *
  * Clone this Curl::Easy instance, creating a new instance.
  * This method duplicates the underlying CURL* handle.
+ * A temporary multipart form attached during a request is not copied;
+ * supply new PostFields to send a multipart request with the clone.
  */
 static VALUE ruby_curl_easy_clone(VALUE self) {
   ruby_curl_easy *rbce, *newrbce;
 
-  TypedData_Get_Struct(self, ruby_curl_easy, &ruby_curl_easy_data_type, rbce);
+  rbce = ruby_curl_easy_get_handle(self);
 
   newrbce = ALLOC(ruby_curl_easy);
   if (!newrbce) {
@@ -751,14 +1647,39 @@ static VALUE ruby_curl_easy_clone(VALUE self) {
 
   /* now deep copy */
   newrbce->curl = curl_easy_duphandle(rbce->curl);
+  if (!newrbce->curl) {
+    free(newrbce);
+    rb_raise(rb_eNoMemError, "Failed to duplicate Curl::Easy handle");
+  }
+  /* duphandle borrows HTTPPOST, whose form is freed when the original
+   * perform unwinds. Only reset it when attached: setting HTTPPOST also
+   * changes request options and must not affect ordinary POST/upload clones. */
+  if (newrbce->multipart_form_active) {
+    CURLcode ecode = curl_easy_setopt(newrbce->curl, CURLOPT_HTTPPOST, NULL);
+    if (ecode != CURLE_OK) {
+      curl_easy_cleanup(newrbce->curl);
+      free(newrbce);
+      raise_curl_easy_error_exception(ecode);
+    }
+    newrbce->multipart_form_active = 0;
+  }
   newrbce->curl_headers = (rbce->curl_headers) ? duplicate_curl_slist(rbce->curl_headers) : NULL;
   newrbce->curl_proxy_headers = (rbce->curl_proxy_headers) ? duplicate_curl_slist(rbce->curl_proxy_headers) : NULL;
   newrbce->curl_ftp_commands = (rbce->curl_ftp_commands) ? duplicate_curl_slist(rbce->curl_ftp_commands) : NULL;
   newrbce->curl_resolve = (rbce->curl_resolve) ? duplicate_curl_slist(rbce->curl_resolve) : NULL;
+  newrbce->curl_connect_to = (rbce->curl_connect_to) ? duplicate_curl_slist(rbce->curl_connect_to) : NULL;
+  newrbce->network_allowed_cidr_rules = NULL;
+  newrbce->network_allowed_cidr_rule_count = 0;
+  newrbce->network_allowed_hosts = NULL;
+  newrbce->network_allowed_host_count = 0;
 
   /* A cloned easy should not retain ownership reference to the original multi. */
   newrbce->multi = Qnil;
   newrbce->callback_error = Qnil;
+  newrbce->callback_active = 0;
+  newrbce->unsafe_destination_blocked = 0;
+  memset(newrbce->unsafe_destination_error, 0, CURL_ERROR_SIZE);
+  newrbce->native_active = 0;
 
   if (rbce->opts != Qnil) {
     newrbce->opts = rb_funcall(rbce->opts, rb_intern("dup"), 0);
@@ -766,6 +1687,21 @@ static VALUE ruby_curl_easy_clone(VALUE self) {
 
   /* Set the error buffer on the new curl handle using the new err_buf */
   curl_easy_setopt(newrbce->curl, CURLOPT_ERRORBUFFER, newrbce->err_buf);
+
+  if (newrbce->opts != Qnil) {
+    VALUE upload = rb_hash_aref(newrbce->opts, rb_easy_hkey("upload"));
+    if (!NIL_P(upload)) {
+      rb_hash_aset(newrbce->opts, rb_easy_hkey("upload"), duplicate_upload(upload));
+      curl_easy_setopt(newrbce->curl, CURLOPT_READFUNCTION, (curl_read_callback)read_data_handler);
+      curl_easy_setopt(newrbce->curl, CURLOPT_READDATA, newrbce);
+#ifdef HAVE_CURLOPT_SEEKFUNCTION
+      curl_easy_setopt(newrbce->curl, CURLOPT_SEEKFUNCTION, (curl_seek_callback)seek_data_handler);
+#endif
+#ifdef HAVE_CURLOPT_SEEKDATA
+      curl_easy_setopt(newrbce->curl, CURLOPT_SEEKDATA, newrbce);
+#endif
+    }
+  }
 
   VALUE clone = TypedData_Wrap_Struct(cCurlEasy, &ruby_curl_easy_data_type, newrbce);
   newrbce->self = clone;
@@ -786,11 +1722,18 @@ static VALUE ruby_curl_easy_close(VALUE self) {
   CURLcode ecode;
   ruby_curl_easy *rbce;
 
-  TypedData_Get_Struct(self, ruby_curl_easy, &ruby_curl_easy_data_type, rbce);
+  rbce = ruby_curl_easy_get_handle(self);
 
   if (rbce->callback_active) {
     rb_raise(rb_eRuntimeError, "Cannot close an active curl handle within a callback");
   }
+
+  if (rbce->native_active) {
+    rb_raise(rb_eRuntimeError, "Cannot close an active curl handle during native operation");
+  }
+
+  ruby_curl_easy_check_idle(rbce);
+  ruby_curl_easy_detach(self, rbce);
 
   ruby_curl_easy_free(rbce);
 
@@ -804,6 +1747,9 @@ static VALUE ruby_curl_easy_close(VALUE self) {
 
   ruby_curl_easy_zero(rbce);
   rbce->self = self;
+
+  curb_easy_apply_thread_defaults(rbce);
+  curl_easy_setopt(rbce->curl, CURLOPT_ERRORBUFFER, rbce->err_buf);
 
   /* give the new curl handle a reference back to the ruby object */
   ecode = curl_easy_setopt(rbce->curl, CURLOPT_PRIVATE, (void*)rbce);
@@ -830,11 +1776,18 @@ static VALUE ruby_curl_easy_reset(VALUE self) {
   CURLcode ecode;
   ruby_curl_easy *rbce;
   VALUE opts_dup;
-  TypedData_Get_Struct(self, ruby_curl_easy, &ruby_curl_easy_data_type, rbce);
+  rbce = ruby_curl_easy_get_handle(self);
 
   if (rbce->callback_active) {
     rb_raise(rb_eRuntimeError, "Cannot close an active curl handle within a callback");
   }
+
+  if (rbce->native_active) {
+    rb_raise(rb_eRuntimeError, "Cannot reset an active curl handle during native operation");
+  }
+
+  ruby_curl_easy_check_idle(rbce);
+  ruby_curl_easy_detach(self, rbce);
 
   opts_dup = rb_funcall(rbce->opts, rb_intern("dup"), 0);
 
@@ -843,6 +1796,7 @@ static VALUE ruby_curl_easy_reset(VALUE self) {
   ruby_curl_easy_zero(rbce);
   rbce->self = self;
 
+  curb_easy_apply_thread_defaults(rbce);
   curl_easy_setopt(rbce->curl, CURLOPT_ERRORBUFFER, &rbce->err_buf);
 
   /* reset clobbers the private setting, so reset it to self */
@@ -916,7 +1870,7 @@ static VALUE ruby_curl_easy_proxy_headers_set(VALUE self, VALUE proxy_headers) {
 static VALUE ruby_curl_easy_headers_get(VALUE self) {
   ruby_curl_easy *rbce;
   VALUE headers;
-  TypedData_Get_Struct(self, ruby_curl_easy, &ruby_curl_easy_data_type, rbce);
+  rbce = ruby_curl_easy_get_handle(self);
   headers = rb_easy_get("headers");//rb_hash_aref(rbce->opts, rb_intern("headers"));
   if (headers == Qnil) { headers = rb_easy_set("headers", rb_hash_new()); }
   return headers;
@@ -951,7 +1905,7 @@ static VALUE ruby_curl_easy_headers_get(VALUE self) {
 static VALUE ruby_curl_easy_proxy_headers_get(VALUE self) {
   ruby_curl_easy *rbce;
   VALUE proxy_headers;
-  TypedData_Get_Struct(self, ruby_curl_easy, &ruby_curl_easy_data_type, rbce);
+  rbce = ruby_curl_easy_get_handle(self);
   proxy_headers = rb_easy_get("proxy_headers");//rb_hash_aref(rbce->opts, rb_intern("proxy_headers"));
   if (proxy_headers == Qnil) { proxy_headers = rb_easy_set("proxy_headers", rb_hash_new()); }
   return proxy_headers;
@@ -1182,7 +2136,17 @@ static VALUE ruby_curl_easy_useragent_get(VALUE self) {
  *
  * This is handy if you want to perform a POST against a Curl::Multi instance.
  */
-static VALUE ruby_curl_easy_post_body_set_with_mode(VALUE self, VALUE post_body, int force_http_get_on_nil) {
+struct post_body_set_args {
+  VALUE self;
+  VALUE post_body;
+  int force_http_get_on_nil;
+};
+
+static VALUE ruby_curl_easy_post_body_set_with_mode_body(VALUE argp) {
+  struct post_body_set_args *args = (struct post_body_set_args *)argp;
+  VALUE self = args->self;
+  VALUE post_body = args->post_body;
+  int force_http_get_on_nil = args->force_http_get_on_nil;
   ruby_curl_easy *rbce;
   CURL *curl;
 
@@ -1191,7 +2155,7 @@ static VALUE ruby_curl_easy_post_body_set_with_mode(VALUE self, VALUE post_body,
   char *data;
   long len;
 
-  TypedData_Get_Struct(self, ruby_curl_easy, &ruby_curl_easy_data_type, rbce);
+  rbce = ruby_curl_easy_get_handle(self);
 
   curl = rbce->curl;
 
@@ -1246,6 +2210,17 @@ static VALUE ruby_curl_easy_post_body_set_with_mode(VALUE self, VALUE post_body,
   return Qnil;
 }
 
+static VALUE ruby_curl_easy_post_body_set_with_mode(VALUE self, VALUE post_body, int force_http_get_on_nil) {
+  ruby_curl_easy *rbce;
+  struct post_body_set_args args = { self, post_body, force_http_get_on_nil };
+
+  rbce = ruby_curl_easy_get_handle(self);
+  ruby_curl_easy_enter_native(rbce);
+
+  return rb_ensure(ruby_curl_easy_post_body_set_with_mode_body, (VALUE)&args,
+                   ruby_curl_easy_leave_native, (VALUE)rbce);
+}
+
 static VALUE ruby_curl_easy_post_body_set(VALUE self, VALUE post_body) {
   return ruby_curl_easy_post_body_set_with_mode(self, post_body, 1);
 }
@@ -1272,12 +2247,72 @@ static VALUE ruby_curl_easy_put_data_set(VALUE self, VALUE data) {
   ruby_curl_easy *rbce;
   CURL *curl;
   VALUE upload;
+  VALUE upload_stream = data;
   VALUE headers;
+  VALUE infile_size = Qnil;
 
-  TypedData_Get_Struct(self, ruby_curl_easy, &ruby_curl_easy_data_type, rbce);
+  rbce = ruby_curl_easy_get_handle(self);
+
+  /*
+   * Validate and prepare Ruby-visible state before mutating the CURL handle.
+   * Several branches below can raise (header type, stat, size, to_s).
+   */
+  if (!rb_easy_nil("headers")) {
+    if (rb_easy_type_check("headers", T_ARRAY) || rb_easy_type_check("headers", T_STRING)) {
+      rb_raise(rb_eRuntimeError, "Must set headers as a HASH to modify the headers in an PUT request");
+    }
+  }
+
+  if (!NIL_P(data) && !rb_respond_to(data, rb_intern("read"))) {
+    if (rb_respond_to(data, rb_intern("to_s"))) {
+      upload_stream = rb_obj_as_string(data);
+    } else {
+      rb_raise(rb_eRuntimeError, "PUT data must respond to read or to_s");
+    }
+  }
+
+  headers = rb_easy_get("headers");
+  if( headers == Qnil ) {
+    headers = rb_hash_new();
+  }
+
+  if (!NIL_P(data) && rb_respond_to(data, rb_intern("read"))) {
+    VALUE stat = Qnil;
+    if (rb_respond_to(data, rb_intern("stat"))) {
+      stat = rb_funcall(data, rb_intern("stat"), 0);
+    }
+    if(!NIL_P(stat) && stat != Qfalse && rb_hash_aref(headers, rb_str_new2("Content-Length")) == Qnil) {
+      VALUE size;
+      if( rb_hash_aref(headers, rb_str_new2("Expect")) == Qnil ) {
+        rb_hash_aset(headers, rb_str_new2("Expect"), rb_str_new2(""));
+      }
+      size = rb_funcall(stat, rb_intern("size"), 0);
+      infile_size = size;
+    }
+    else if( rb_hash_aref(headers, rb_str_new2("Content-Length")) == Qnil && rb_hash_aref(headers, rb_str_new2("Transfer-Encoding")) == Qnil ) {
+      rb_hash_aset(headers, rb_str_new2("Transfer-Encoding"), rb_str_new2("chunked"));
+    }
+    else if( rb_hash_aref(headers, rb_str_new2("Content-Length")) ) {
+      VALUE size = rb_funcall(rb_hash_aref(headers, rb_str_new2("Content-Length")), rb_intern("to_i"), 0);
+      infile_size = size;
+    }
+  }
+  else if (!NIL_P(data) && rb_respond_to(data, rb_intern("to_s"))) {
+    infile_size = LONG2NUM(RSTRING_LEN(upload_stream));
+    if( rb_hash_aref(headers, rb_str_new2("Expect")) == Qnil ) {
+      rb_hash_aset(headers, rb_str_new2("Expect"), rb_str_new2(""));
+    }
+  }
+  else if (NIL_P(data)) {
+    /* Preserve legacy nil handling: configure an upload with no payload. */
+  }
+  else {
+    rb_raise(rb_eRuntimeError, "PUT data must respond to read or to_s");
+  }
+  rb_easy_set("headers",headers);
 
   upload = ruby_curl_upload_new(cCurlUpload);
-  ruby_curl_upload_stream_set(upload,data);
+  ruby_curl_upload_stream_set(upload, upload_stream);
 
   curl = rbce->curl;
   rb_easy_set("upload", upload); /* keep the upload object alive as long as
@@ -1298,52 +2333,9 @@ static VALUE ruby_curl_easy_put_data_set(VALUE self, VALUE data) {
   curl_easy_setopt(curl, CURLOPT_SEEKDATA, rbce);
 #endif
 
-  /*
-   * we need to set specific headers for the PUT to work... so
-   * convert the internal headers structure to a HASH if one is set
-   */
-  if (!rb_easy_nil("headers")) {
-    if (rb_easy_type_check("headers", T_ARRAY) || rb_easy_type_check("headers", T_STRING)) {
-      rb_raise(rb_eRuntimeError, "Must set headers as a HASH to modify the headers in an PUT request");
-    }
+  if (!NIL_P(infile_size)) {
+    curl_easy_setopt(curl, CURLOPT_INFILESIZE, NUM2LONG(infile_size));
   }
-
-  // exit fast if the payload is empty
-  if (NIL_P(data)) { return data; }
-
-  headers = rb_easy_get("headers");
-  if( headers == Qnil ) {
-    headers = rb_hash_new();
-  }
-
-  if (rb_respond_to(data, rb_intern("read"))) {
-    VALUE stat = rb_funcall(data, rb_intern("stat"), 0);
-    if( stat && rb_hash_aref(headers, rb_str_new2("Content-Length")) == Qnil) {
-      VALUE size;
-      if( rb_hash_aref(headers, rb_str_new2("Expect")) == Qnil ) {
-        rb_hash_aset(headers, rb_str_new2("Expect"), rb_str_new2(""));
-      }
-      size = rb_funcall(stat, rb_intern("size"), 0);
-      curl_easy_setopt(curl, CURLOPT_INFILESIZE, NUM2LONG(size));
-    }
-    else if( rb_hash_aref(headers, rb_str_new2("Content-Length")) == Qnil && rb_hash_aref(headers, rb_str_new2("Transfer-Encoding")) == Qnil ) {
-      rb_hash_aset(headers, rb_str_new2("Transfer-Encoding"), rb_str_new2("chunked"));
-    }
-    else if( rb_hash_aref(headers, rb_str_new2("Content-Length")) ) {
-      VALUE size = rb_funcall(rb_hash_aref(headers, rb_str_new2("Content-Length")), rb_intern("to_i"), 0);
-      curl_easy_setopt(curl, CURLOPT_INFILESIZE, NUM2LONG(size));
-    }
-  }
-  else if (rb_respond_to(data, rb_intern("to_s"))) {
-    curl_easy_setopt(curl, CURLOPT_INFILESIZE, RSTRING_LEN(data));
-    if( rb_hash_aref(headers, rb_str_new2("Expect")) == Qnil ) {
-      rb_hash_aset(headers, rb_str_new2("Expect"), rb_str_new2(""));
-    }
-  }
-  else {
-    rb_raise(rb_eRuntimeError, "PUT data must respond to read or to_s");
-  }
-  rb_easy_set("headers",headers);
 
   // if we made it this far, all should be well.
   return data;
@@ -1392,6 +2384,147 @@ static VALUE ruby_curl_easy_resolve_set(VALUE self, VALUE resolve) {
  */
 static VALUE ruby_curl_easy_resolve_get(VALUE self) {
   CURB_OBJECT_HGETTER(ruby_curl_easy, resolve);
+}
+
+/*
+ * call-seq:
+ *   easy.connect_to = [ "example.com:80:127.0.0.1:80" ]   => [ "example.com:80:127.0.0.1:80" ]
+ *
+ * Set the connect-to list to redirect matching request host/port pairs to
+ * alternate connection host/port pairs.
+ */
+static VALUE ruby_curl_easy_connect_to_set(VALUE self, VALUE connect_to) {
+  CURB_OBJECT_HSETTER(ruby_curl_easy, connect_to);
+}
+
+/*
+ * call-seq:
+ *   easy.connect_to                                => array or nil
+ */
+static VALUE ruby_curl_easy_connect_to_get(VALUE self) {
+  CURB_OBJECT_HGETTER(ruby_curl_easy, connect_to);
+}
+
+/*
+ * call-seq:
+ *   easy.doh_url = "https://dns.example/dns-query"       => "https://dns.example/dns-query"
+ *
+ * Set the DNS-over-HTTPS URL to use for resolving hostnames.
+ */
+static VALUE ruby_curl_easy_doh_url_set(VALUE self, VALUE doh_url) {
+  CURB_OBJECT_HSETTER(ruby_curl_easy, doh_url);
+}
+
+/*
+ * call-seq:
+ *   easy.doh_url                                => string or nil
+ */
+static VALUE ruby_curl_easy_doh_url_get(VALUE self) {
+  CURB_OBJECT_HGETTER(ruby_curl_easy, doh_url);
+}
+
+#ifdef HAVE_CURLOPT_DNS_SERVERS
+/*
+ * call-seq:
+ *   easy.dns_servers                                => string or nil
+ */
+static VALUE ruby_curl_easy_dns_servers_get(VALUE self) {
+  CURB_OBJECT_HGETTER(ruby_curl_easy, dns_servers);
+}
+#endif
+
+static VALUE ruby_curl_easy_allow_unix_socket_set(VALUE self, VALUE allow) {
+  ruby_curl_easy *rbce;
+
+  rbce = ruby_curl_easy_get_handle(self);
+  rbce->allow_unix_socket = RTEST(allow) ? 1 : 0;
+
+  return allow;
+}
+
+static VALUE ruby_curl_easy_allow_proxy_set(VALUE self, VALUE allow) {
+  ruby_curl_easy *rbce;
+
+  rbce = ruby_curl_easy_get_handle(self);
+  rbce->allow_proxy = RTEST(allow) ? 1 : 0;
+
+  return allow;
+}
+
+/*
+ * call-seq:
+ *   easy.allowed_cidrs = ["203.0.113.0/24"]          => ["203.0.113.0/24"]
+ *
+ * Set resolved-peer CIDR ranges that are allowed when network_policy is :public.
+ * Private/local unsafe ranges are still blocked before this allowlist is
+ * evaluated.
+ */
+static VALUE ruby_curl_easy_allowed_cidrs_set(VALUE self, VALUE cidrs) {
+  ruby_curl_easy *rbce;
+  VALUE normalized;
+  VALUE stored;
+
+  rbce = ruby_curl_easy_get_handle(self);
+  normalized = curb_normalize_cidr_list(cidrs);
+  stored = curb_dup_string_array(normalized);
+  rb_hash_aset(rbce->opts, rb_easy_hkey("allowed_cidrs"), stored);
+  if (rbce->network_policy == CURB_NETWORK_POLICY_PUBLIC) {
+    curb_prepare_network_allowed_cidr_rules(rbce);
+  } else {
+    curb_clear_network_allowed_cidr_rules(rbce);
+  }
+
+  return curb_dup_string_array(stored);
+}
+
+/*
+ * call-seq:
+ *   easy.allowed_cidrs                                => array or nil
+ */
+static VALUE ruby_curl_easy_allowed_cidrs_get(VALUE self) {
+  ruby_curl_easy *rbce;
+  VALUE cidrs;
+
+  rbce = ruby_curl_easy_get_handle(self);
+  cidrs = rb_hash_aref(rbce->opts, rb_easy_hkey("allowed_cidrs"));
+
+  return curb_dup_string_array(cidrs);
+}
+
+/*
+ * call-seq:
+ *   easy.allowed_hosts = ["api.example.com"]          => ["api.example.com"]
+ *
+ * Set URL hosts allowed for this handle. When libcurl supports
+ * CURLOPT_PREREQFUNCTION, this is checked before each request, including
+ * followed redirects.
+ */
+static VALUE ruby_curl_easy_allowed_hosts_set(VALUE self, VALUE hosts) {
+  ruby_curl_easy *rbce;
+  VALUE normalized;
+  VALUE stored;
+
+  rbce = ruby_curl_easy_get_handle(self);
+  normalized = curb_normalize_host_list(hosts);
+  stored = curb_dup_string_array(normalized);
+  rb_hash_aset(rbce->opts, rb_easy_hkey("allowed_hosts"), stored);
+  curb_prepare_network_allowed_hosts(rbce);
+
+  return curb_dup_string_array(stored);
+}
+
+/*
+ * call-seq:
+ *   easy.allowed_hosts                                => array or nil
+ */
+static VALUE ruby_curl_easy_allowed_hosts_get(VALUE self) {
+  ruby_curl_easy *rbce;
+  VALUE hosts;
+
+  rbce = ruby_curl_easy_get_handle(self);
+  hosts = rb_hash_aref(rbce->opts, rb_easy_hkey("allowed_hosts"));
+
+  return curb_dup_string_array(hosts);
 }
 
 /* ================== IMMED ATTRS ==================*/
@@ -1514,6 +2647,41 @@ static VALUE ruby_curl_easy_proxy_type_get(VALUE self) {
   (!strncmp("any",node,3)) ? CURLAUTH_ANY : 0
 #endif
 /*
+ * Convert the arguments to http_auth_types= / proxy_auth_types= into a
+ * CURLAUTH bitmask. Accepts nil, an Integer mask, or one or more auth type
+ * names (symbols/strings), either as separate args or as a single Array.
+ */
+static long ruby_curl_easy_auth_types_to_mask(VALUE args_ary) {
+  long i, len;
+  char* node = NULL;
+  long mask = 0;
+  VALUE first;
+
+  /* easy.http_auth_types = [:basic, :digest] arrives as a single Array arg */
+  if (RARRAY_LEN(args_ary) == 1 && RB_TYPE_P(rb_ary_entry(args_ary,0), T_ARRAY)) {
+    args_ary = rb_ary_entry(args_ary,0);
+  }
+
+  len = RARRAY_LEN(args_ary);
+  first = rb_ary_entry(args_ary,0);
+
+  if (len == 1 && (first == Qnil || TYPE(first) == T_FIXNUM || TYPE(first) == T_BIGNUM)) {
+    return first == Qnil ? 0 : NUM2LONG(first);
+  }
+
+  // we could have multiple values, but they should be symbols
+  // rb_obj_as_string always yields a String, even if to_s misbehaves;
+  // RSTRING_PTR on a raw rb_funcall result would crash if #to_s returned
+  // a non-String (e.g. a Fixnum, whose VALUE isn't a real pointer).
+  for( i = 0; i < len; ++i ) {
+    VALUE node_str = rb_obj_as_string(rb_ary_entry(args_ary,i));
+    node = StringValuePtr(node_str);
+    mask |= CURL_HTTPAUTH_STR_TO_NUM(node);
+  }
+  return mask;
+}
+
+/*
  * call-seq:
  *   easy.http_auth_types = fixnum or nil             => fixnum or nil
  *   easy.http_auth_types = [:basic,:digest,:digest_ie,:gssnegotiate, :ntlm, :any, :anysafe]
@@ -1522,37 +2690,14 @@ static VALUE ruby_curl_easy_proxy_type_get(VALUE self) {
  * +perform+ calls. This is a bitmap made by ORing together the
  * Curl::CURLAUTH constants.
  */
-static VALUE ruby_curl_easy_http_auth_types_set(int argc, VALUE *argv, VALUE self) {//VALUE self, VALUE http_auth_types) {
+static VALUE ruby_curl_easy_http_auth_types_set(int argc, VALUE *argv, VALUE self) {
   ruby_curl_easy *rbce;
   VALUE args_ary;
-  long i, len;
-  char* node = NULL;
-  long mask = 0;
 
   rb_scan_args(argc, argv, "*", &args_ary);
-  TypedData_Get_Struct(self, ruby_curl_easy, &ruby_curl_easy_data_type, rbce);
+  rbce = ruby_curl_easy_get_handle(self);
 
-  len = RARRAY_LEN(args_ary);
-
-  if (len == 1 && (rb_ary_entry(args_ary,0) == Qnil || TYPE(rb_ary_entry(args_ary,0)) == T_FIXNUM ||
-        TYPE(rb_ary_entry(args_ary,0)) == T_BIGNUM)) {
-    if (rb_ary_entry(args_ary,0) == Qnil) {
-      rbce->http_auth_types = 0;
-    }
-    else {
-      rbce->http_auth_types = NUM2LONG(rb_ary_entry(args_ary,0));
-    }
-  }
-  else {
-    // we could have multiple values, but they should be symbols
-    node = RSTRING_PTR(rb_funcall(rb_ary_entry(args_ary,0),rb_intern("to_s"),0));
-    mask = CURL_HTTPAUTH_STR_TO_NUM(node);
-    for( i = 1; i < len; ++i ) {
-      node = RSTRING_PTR(rb_funcall(rb_ary_entry(args_ary,i),rb_intern("to_s"),0));
-      mask |= CURL_HTTPAUTH_STR_TO_NUM(node);
-    }
-    rbce->http_auth_types = mask;
-  }
+  rbce->http_auth_types = ruby_curl_easy_auth_types_to_mask(args_ary);
   return LONG2NUM(rbce->http_auth_types);
 }
 
@@ -1570,13 +2715,21 @@ static VALUE ruby_curl_easy_http_auth_types_get(VALUE self) {
 /*
  * call-seq:
  *   easy.proxy_auth_types = fixnum or nil            => fixnum or nil
+ *   easy.proxy_auth_types = [:basic,:digest,:digest_ie,:gssnegotiate, :ntlm, :any, :anysafe]
  *
  * Set the proxy authentication types that may be used for the following
  * +perform+ calls. This is a bitmap made by ORing together the
  * Curl::CURLAUTH constants.
  */
-static VALUE ruby_curl_easy_proxy_auth_types_set(VALUE self, VALUE proxy_auth_types) {
-  CURB_IMMED_SETTER(ruby_curl_easy, proxy_auth_types, 0);
+static VALUE ruby_curl_easy_proxy_auth_types_set(int argc, VALUE *argv, VALUE self) {
+  ruby_curl_easy *rbce;
+  VALUE args_ary;
+
+  rb_scan_args(argc, argv, "*", &args_ary);
+  rbce = ruby_curl_easy_get_handle(self);
+
+  rbce->proxy_auth_types = ruby_curl_easy_auth_types_to_mask(args_ary);
+  return LONG2NUM(rbce->proxy_auth_types);
 }
 
 /*
@@ -1635,7 +2788,7 @@ static VALUE ruby_curl_easy_max_redirects_get(VALUE self) {
  */
 static VALUE ruby_curl_easy_timeout_set(VALUE self, VALUE timeout_s) {
   ruby_curl_easy *rbce;
-  TypedData_Get_Struct(self, ruby_curl_easy, &ruby_curl_easy_data_type, rbce);
+  rbce = ruby_curl_easy_get_handle(self);
 
   if (Qnil == timeout_s || NUM2DBL(timeout_s) <= 0.0) {
     rbce->timeout_ms = 0;
@@ -1658,7 +2811,7 @@ static VALUE ruby_curl_easy_timeout_set(VALUE self, VALUE timeout_s) {
  */
 static VALUE ruby_curl_easy_timeout_get(VALUE self) {
   ruby_curl_easy *rbce;
-  TypedData_Get_Struct(self, ruby_curl_easy, &ruby_curl_easy_data_type, rbce);
+  rbce = ruby_curl_easy_get_handle(self);
   return DBL2NUM(rbce->timeout_ms / 1000.0);
 }
 
@@ -1676,7 +2829,7 @@ static VALUE ruby_curl_easy_timeout_get(VALUE self) {
  */
 static VALUE ruby_curl_easy_timeout_ms_set(VALUE self, VALUE timeout_ms) {
   ruby_curl_easy *rbce;
-  TypedData_Get_Struct(self, ruby_curl_easy, &ruby_curl_easy_data_type, rbce);
+  rbce = ruby_curl_easy_get_handle(self);
 
   if (Qnil == timeout_ms || NUM2DBL(timeout_ms) <= 0.0) {
     rbce->timeout_ms = 0;
@@ -1696,7 +2849,7 @@ static VALUE ruby_curl_easy_timeout_ms_set(VALUE self, VALUE timeout_ms) {
  */
 static VALUE ruby_curl_easy_timeout_ms_get(VALUE self) {
   ruby_curl_easy *rbce;
-  TypedData_Get_Struct(self, ruby_curl_easy, &ruby_curl_easy_data_type, rbce);
+  rbce = ruby_curl_easy_get_handle(self);
   return LONG2NUM(rbce->timeout_ms);
 }
 
@@ -2169,7 +3322,7 @@ static VALUE ruby_curl_easy_use_netrc_q(VALUE self) {
  */
 static VALUE ruby_curl_easy_autoreferer_set(VALUE self, VALUE autoreferer) {
   ruby_curl_easy *rbce;
-  TypedData_Get_Struct(self, ruby_curl_easy, &ruby_curl_easy_data_type, rbce);
+  rbce = ruby_curl_easy_get_handle(self);
 
   if (Qtrue == autoreferer) {
     curl_easy_setopt(rbce->curl, CURLOPT_AUTOREFERER, 1);
@@ -2326,7 +3479,7 @@ static VALUE ruby_curl_easy_ignore_content_length_q(VALUE self) {
 static VALUE ruby_curl_easy_resolve_mode(VALUE self) {
   ruby_curl_easy *rbce;
   unsigned short rm;
-  TypedData_Get_Struct(self, ruby_curl_easy, &ruby_curl_easy_data_type, rbce);
+  rbce = ruby_curl_easy_get_handle(self);
 
   rm = rbce->resolve_mode;
 
@@ -2358,7 +3511,7 @@ static VALUE ruby_curl_easy_resolve_mode_set(VALUE self, VALUE resolve_mode) {
   } else {
     ruby_curl_easy *rbce;
     ID resolve_mode_id;
-    TypedData_Get_Struct(self, ruby_curl_easy, &ruby_curl_easy_data_type, rbce);
+    rbce = ruby_curl_easy_get_handle(self);
 
     resolve_mode_id = rb_to_id(resolve_mode);
 
@@ -2380,6 +3533,101 @@ static VALUE ruby_curl_easy_resolve_mode_set(VALUE self, VALUE resolve_mode) {
 
 /*
  * call-seq:
+ *   easy.network_policy                                      => symbol
+ *
+ * Determine which native network policy will be enforced when libcurl opens
+ * sockets for this handle.
+ */
+static VALUE ruby_curl_easy_network_policy_get(VALUE self) {
+  ruby_curl_easy *rbce;
+  rbce = ruby_curl_easy_get_handle(self);
+
+  switch (rbce->network_policy) {
+  case CURB_NETWORK_POLICY_PUBLIC:
+    return ID2SYM(idNetworkPolicyPublic);
+  case CURB_NETWORK_POLICY_NONE:
+  default:
+    return ID2SYM(idNetworkPolicyNone);
+  }
+}
+
+/*
+ * call-seq:
+ *   easy.network_policy = symbol                             => symbol
+ *
+ * Supported values:
+ * [:none]    disables native destination checks.
+ * [:public]  blocks loopback, private, link-local, multicast,
+ *            unspecified, metadata, and other non-public addresses.
+ */
+static VALUE ruby_curl_easy_network_policy_set(VALUE self, VALUE network_policy) {
+  ruby_curl_easy *rbce;
+  ID network_policy_id;
+
+  rbce = ruby_curl_easy_get_handle(self);
+
+  if (NIL_P(network_policy)) {
+    rbce->network_policy = CURB_NETWORK_POLICY_NONE;
+    return ID2SYM(idNetworkPolicyNone);
+  }
+
+  if (TYPE(network_policy) != T_SYMBOL) {
+    rb_raise(rb_eTypeError, "network_policy must be a Symbol");
+  }
+
+  network_policy_id = rb_to_id(network_policy);
+
+  if (network_policy_id == idNetworkPolicyNone) {
+    rbce->network_policy = CURB_NETWORK_POLICY_NONE;
+    rbce->allow_proxy = 0;
+    return network_policy;
+  } else if (network_policy_id == idNetworkPolicyPublic) {
+#ifndef CURB_HAVE_OPENSOCKET_NETWORK_POLICY
+    rb_raise(rb_eNotImpError, "network_policy=:public requires CURLOPT_OPENSOCKETFUNCTION support");
+#else
+    rbce->network_policy = CURB_NETWORK_POLICY_PUBLIC;
+    rbce->allow_proxy = 0;
+    return network_policy;
+#endif
+  }
+
+  rb_raise(rb_eArgError, "network_policy must be one of :none, :public");
+}
+
+/*
+ * call-seq:
+ *   easy.unsafe_destination_error                             => string or nil
+ *
+ * Return the native network policy block reason from the most recent transfer.
+ */
+static VALUE ruby_curl_easy_unsafe_destination_error_get(VALUE self) {
+  ruby_curl_easy *rbce;
+  rbce = ruby_curl_easy_get_handle(self);
+
+  if (rbce->unsafe_destination_blocked && rbce->unsafe_destination_error[0]) {
+    return rb_str_new2(rbce->unsafe_destination_error);
+  }
+
+  return Qnil;
+}
+
+#ifdef HAVE_CURLOPT_UNIX_SOCKET_PATH
+/*
+ * call-seq:
+ *   easy.unix_socket_path                             => string or nil
+ *
+ * Return the configured Unix socket path, if set through CURLOPT_UNIX_SOCKET_PATH.
+ */
+static VALUE ruby_curl_easy_unix_socket_path_get(VALUE self) {
+  ruby_curl_easy *rbce;
+  rbce = ruby_curl_easy_get_handle(self);
+
+  return rb_easy_get("unix_socket_path");
+}
+#endif
+
+/*
+ * call-seq:
  *   easy.http_version = Curl::HTTP_1_1               => Curl::HTTP_1_1
  *
  * Force libcurl to use a specific HTTP protocol version. By default libcurl
@@ -2391,7 +3639,7 @@ static VALUE ruby_curl_easy_http_version_set(VALUE self, VALUE version) {
   ruby_curl_easy *rbce;
   long http_version;
 
-  TypedData_Get_Struct(self, ruby_curl_easy, &ruby_curl_easy_data_type, rbce);
+  rbce = ruby_curl_easy_get_handle(self);
 
   if (NIL_P(version)) {
     http_version = CURL_HTTP_VERSION_NONE;
@@ -2413,7 +3661,7 @@ static VALUE ruby_curl_easy_http_version_set(VALUE self, VALUE version) {
 static VALUE ruby_curl_easy_http_version_get(VALUE self) {
   ruby_curl_easy *rbce;
 
-  TypedData_Get_Struct(self, ruby_curl_easy, &ruby_curl_easy_data_type, rbce);
+  rbce = ruby_curl_easy_get_handle(self);
 
   return LONG2NUM(rbce->http_version);
 }
@@ -2659,7 +3907,7 @@ static VALUE cb_each_ftp_command(VALUE ftp_command, VALUE wrap, int _c, const VA
   TypedData_Get_Struct(wrap, struct curl_slist *, &curl_slist_ptr_type, list);
 
   ftp_command_string = rb_obj_as_string(ftp_command);
-  struct curl_slist *new_list = curl_slist_append(*list, StringValuePtr(ftp_command));
+  struct curl_slist *new_list = curl_slist_append(*list, StringValuePtr(ftp_command_string));
   if (!new_list) {
     rb_raise(rb_eNoMemError, "Failed to append to FTP command list");
   }
@@ -2677,7 +3925,7 @@ static VALUE cb_each_resolve(VALUE resolve, VALUE wrap, int _c, const VALUE *_pt
   TypedData_Get_Struct(wrap, struct curl_slist *, &curl_slist_ptr_type, list);
 
   resolve_string = rb_obj_as_string(resolve);
-  struct curl_slist *new_list = curl_slist_append(*list, StringValuePtr(resolve));
+  struct curl_slist *new_list = curl_slist_append(*list, StringValuePtr(resolve_string));
   if (!new_list) {
     rb_raise(rb_eNoMemError, "Failed to append to resolve list");
   }
@@ -2687,12 +3935,31 @@ static VALUE cb_each_resolve(VALUE resolve, VALUE wrap, int _c, const VALUE *_pt
 }
 
 /***********************************************
+ * This is an rb_iterate callback used to set up the connect-to list.
+ */
+static VALUE cb_each_connect_to(VALUE connect_to, VALUE wrap, int _c, const VALUE *_ptr, VALUE unused) {
+  struct curl_slist **list;
+  VALUE connect_to_string;
+  TypedData_Get_Struct(wrap, struct curl_slist *, &curl_slist_ptr_type, list);
+
+  connect_to_string = rb_obj_as_string(connect_to);
+  struct curl_slist *new_list = curl_slist_append(*list, StringValuePtr(connect_to_string));
+  if (!new_list) {
+    rb_raise(rb_eNoMemError, "Failed to append to connect-to list");
+  }
+  *list = new_list;
+
+  return connect_to_string;
+}
+
+/***********************************************
  *
  * Setup a connection
  *
  * Always returns Qtrue, rb_raise on error.
  */
-VALUE ruby_curl_easy_setup(ruby_curl_easy *rbce) {
+static VALUE ruby_curl_easy_setup_body(VALUE arg) {
+  ruby_curl_easy *rbce = (ruby_curl_easy *)arg;
   // TODO this could do with a bit of refactoring...
   CURL *curl;
   VALUE url, _url = rb_easy_get("url");
@@ -2700,9 +3967,14 @@ VALUE ruby_curl_easy_setup(ruby_curl_easy *rbce) {
   struct curl_slist **phdrs = &(rbce->curl_proxy_headers);
   struct curl_slist **cmds = &(rbce->curl_ftp_commands);
   struct curl_slist **rslv = &(rbce->curl_resolve);
+  struct curl_slist **cnto = &(rbce->curl_connect_to);
+  int public_policy_disables_proxy;
 
   curl = rbce->curl;
+  public_policy_disables_proxy = rbce->network_policy == CURB_NETWORK_POLICY_PUBLIC && !rbce->allow_proxy;
   rbce->callback_error = Qnil;
+  rbce->unsafe_destination_blocked = 0;
+  memset(rbce->unsafe_destination_error, 0, CURL_ERROR_SIZE);
 
   if (_url == Qnil) {
     rb_raise(eCurlErrError, "No URL supplied");
@@ -2710,6 +3982,60 @@ VALUE ruby_curl_easy_setup(ruby_curl_easy *rbce) {
 
   url = rb_check_string_type(_url);
   curl_easy_setopt(curl, CURLOPT_URL, StringValuePtr(url));
+
+#ifdef HAVE_CURLOPT_DOH_URL
+  curl_easy_setopt(curl, CURLOPT_DOH_URL, rb_easy_nil("doh_url") ? NULL : rb_easy_get_str("doh_url"));
+#endif
+
+#ifdef HAVE_CURLOPT_DNS_SERVERS
+  if (rbce->network_policy == CURB_NETWORK_POLICY_PUBLIC && !rb_easy_nil("dns_servers")) {
+    rb_raise(eCurlErrUnsafeDestination, "DNS server overrides are disabled by public network policy");
+  }
+  curl_easy_setopt(curl, CURLOPT_DNS_SERVERS, rb_easy_nil("dns_servers") ? NULL : rb_easy_get_str("dns_servers"));
+#endif
+
+#ifdef CURB_HAVE_PREREQ_HOST_POLICY
+  if (!rb_easy_nil("allowed_hosts")) {
+    curb_prepare_network_allowed_hosts(rbce);
+    curl_easy_setopt(curl, CURLOPT_PREREQFUNCTION, curb_host_allowlist_prereq);
+    curl_easy_setopt(curl, CURLOPT_PREREQDATA, rbce);
+  } else {
+    curb_clear_network_allowed_hosts(rbce);
+    curl_easy_setopt(curl, CURLOPT_PREREQFUNCTION, NULL);
+    curl_easy_setopt(curl, CURLOPT_PREREQDATA, NULL);
+  }
+#else
+  curb_clear_network_allowed_hosts(rbce);
+#endif
+
+#ifdef CURB_HAVE_OPENSOCKET_NETWORK_POLICY
+  if (rbce->network_policy == CURB_NETWORK_POLICY_PUBLIC) {
+    curb_prepare_network_allowed_cidr_rules(rbce);
+    curl_easy_setopt(curl, CURLOPT_OPENSOCKETFUNCTION, curb_public_network_opensocket);
+    curl_easy_setopt(curl, CURLOPT_OPENSOCKETDATA, rbce);
+#ifdef HAVE_CURLOPT_FRESH_CONNECT
+    curl_easy_setopt(curl, CURLOPT_FRESH_CONNECT, 1L);
+#endif
+#ifdef HAVE_CURLOPT_FORBID_REUSE
+    curl_easy_setopt(curl, CURLOPT_FORBID_REUSE, 1L);
+#endif
+#ifdef HAVE_CURLOPT_UNIX_SOCKET_PATH
+    if (!rbce->allow_unix_socket) {
+      curl_easy_setopt(curl, CURLOPT_UNIX_SOCKET_PATH, NULL);
+    }
+#endif
+  } else {
+    curb_clear_network_allowed_cidr_rules(rbce);
+    curl_easy_setopt(curl, CURLOPT_OPENSOCKETFUNCTION, NULL);
+    curl_easy_setopt(curl, CURLOPT_OPENSOCKETDATA, NULL);
+#ifdef HAVE_CURLOPT_FRESH_CONNECT
+    curl_easy_setopt(curl, CURLOPT_FRESH_CONNECT, 0L);
+#endif
+#ifdef HAVE_CURLOPT_FORBID_REUSE
+    curl_easy_setopt(curl, CURLOPT_FORBID_REUSE, rbce->forbid_reuse_set ? rbce->forbid_reuse : 0L);
+#endif
+  }
+#endif
 
   // network stuff and auth
   if (!rb_easy_nil("interface_hm")) {
@@ -2742,13 +4068,17 @@ VALUE ruby_curl_easy_setup(ruby_curl_easy *rbce) {
     curl_easy_setopt(curl, CURLOPT_USERPWD, NULL);
   }
 
-  if (rb_easy_nil("proxy_url")) {
+  if (public_policy_disables_proxy) {
+    curl_easy_setopt(curl, CURLOPT_PROXY, "");
+  } else if (rb_easy_nil("proxy_url")) {
     curl_easy_setopt(curl, CURLOPT_PROXY, NULL);
   } else {
     curl_easy_setopt(curl, CURLOPT_PROXY, rb_easy_get_str("proxy_url"));
   }
 
-  if (rb_easy_nil("proxypwd")) {
+  if (public_policy_disables_proxy) {
+    curl_easy_setopt(curl, CURLOPT_PROXYUSERPWD, NULL);
+  } else if (rb_easy_nil("proxypwd")) {
     curl_easy_setopt(curl, CURLOPT_PROXYUSERPWD, NULL);
   } else {
     curl_easy_setopt(curl, CURLOPT_PROXYUSERPWD, rb_easy_get_str("proxypwd"));
@@ -2763,6 +4093,8 @@ VALUE ruby_curl_easy_setup(ruby_curl_easy *rbce) {
 #endif
 
   // body/header procs
+  rbce->downloaded_body_bytes = 0;
+
   if (!rb_easy_nil("body_proc")) {
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, (curl_write_callback)&proc_data_handler_body);
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, rbce);
@@ -2833,7 +4165,8 @@ VALUE ruby_curl_easy_setup(ruby_curl_easy *rbce) {
   curl_easy_setopt(curl, CURLOPT_MAXREDIRS, rbce->max_redirs);
 #endif
 
-  curl_easy_setopt(curl, CURLOPT_HTTPPROXYTUNNEL, rbce->proxy_tunnel);
+  curl_easy_setopt(curl, CURLOPT_HTTPPROXYTUNNEL,
+                   public_policy_disables_proxy ? 0L : rbce->proxy_tunnel);
   curl_easy_setopt(curl, CURLOPT_FILETIME, rbce->fetch_file_time);
   curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, rbce->ssl_verify_peer);
   curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, rbce->ssl_verify_host);
@@ -2996,6 +4329,11 @@ VALUE ruby_curl_easy_setup(ruby_curl_easy *rbce) {
     curl_easy_setopt(curl, CURLOPT_USERAGENT, rb_easy_get_str("useragent"));
   }
 
+  /* Setup can be rerun for safety-policy changes while a handle is attached.
+   * Rebuild slist-backed options from Ruby opts instead of appending to stale
+   * native lists. */
+  ruby_curl_easy_clear_setup_lists(rbce);
+
   /* Setup HTTP headers if necessary */
   curl_easy_setopt(curl, CURLOPT_HTTPHEADER, NULL);   // XXX: maybe we shouldn't be clearing this?
 
@@ -3058,6 +4396,13 @@ VALUE ruby_curl_easy_setup(ruby_curl_easy *rbce) {
     if (rb_easy_type_check("resolve", T_ARRAY)) {
       VALUE wrap = TypedData_Wrap_Struct(rb_cObject, &curl_slist_ptr_type, rslv);
       rb_block_call(rb_easy_get("resolve"), rb_intern("each"), 0, NULL, cb_each_resolve, wrap);
+    } else {
+      VALUE resolve_str = rb_obj_as_string(rb_easy_get("resolve"));
+      struct curl_slist *new_list = curl_slist_append(*rslv, StringValuePtr(resolve_str));
+      if (!new_list) {
+        rb_raise(rb_eNoMemError, "Failed to append to resolve list");
+      }
+      *rslv = new_list;
     }
 
     if (*rslv) {
@@ -3066,7 +4411,43 @@ VALUE ruby_curl_easy_setup(ruby_curl_easy *rbce) {
   }
 #endif
 
+#ifdef HAVE_CURLOPT_CONNECT_TO
+  /* Setup connect-to list if necessary */
+  if (!rb_easy_nil("connect_to")) {
+    if (rb_easy_type_check("connect_to", T_ARRAY)) {
+      VALUE wrap = TypedData_Wrap_Struct(rb_cObject, &curl_slist_ptr_type, cnto);
+      rb_block_call(rb_easy_get("connect_to"), rb_intern("each"), 0, NULL, cb_each_connect_to, wrap);
+    } else {
+      VALUE connect_to_str = rb_obj_as_string(rb_easy_get("connect_to"));
+      struct curl_slist *new_list = curl_slist_append(*cnto, StringValuePtr(connect_to_str));
+      if (!new_list) {
+        rb_raise(rb_eNoMemError, "Failed to append to connect-to list");
+      }
+      *cnto = new_list;
+    }
+
+    if (*cnto) {
+      curl_easy_setopt(curl, CURLOPT_CONNECT_TO, *cnto);
+    }
+  }
+#endif
+
   return Qnil;
+}
+
+VALUE ruby_curl_easy_setup(ruby_curl_easy *rbce) {
+  ruby_curl_easy_enter_native(rbce);
+  return rb_ensure(ruby_curl_easy_setup_body, (VALUE)rbce,
+                   ruby_curl_easy_leave_native, (VALUE)rbce);
+}
+
+static VALUE ruby_curl_easy_setup_self(VALUE self) {
+  ruby_curl_easy *rbce;
+
+  rbce = ruby_curl_easy_get_handle(self);
+  ruby_curl_easy_setup(rbce);
+
+  return self;
 }
 /***********************************************
  *
@@ -3079,6 +4460,7 @@ VALUE ruby_curl_easy_cleanup( VALUE self, ruby_curl_easy *rbce ) {
   CURL *curl = rbce->curl;
   struct curl_slist *ftp_commands;
   struct curl_slist *resolve;
+  struct curl_slist *connect_to;
 
   ruby_curl_easy_clear_headers_list(rbce);
   ruby_curl_easy_clear_proxy_headers_list(rbce);
@@ -3093,17 +4475,69 @@ VALUE ruby_curl_easy_cleanup( VALUE self, ruby_curl_easy *rbce ) {
     ruby_curl_easy_clear_resolve_list(rbce);
   }
 
+  connect_to = rbce->curl_connect_to;
+  if (connect_to) {
+    ruby_curl_easy_clear_connect_to_list(rbce);
+  }
+
+  curb_clear_network_allowed_cidr_rules(rbce);
+  curb_clear_network_allowed_hosts(rbce);
+
   /* clean up a PUT request's curl options. */
   if (!rb_easy_nil("upload")) {
     rb_easy_del("upload"); // set the upload object to Qnil to let the GC clean up
     curl_easy_setopt(curl, CURLOPT_UPLOAD, 0);
     curl_easy_setopt(curl, CURLOPT_READFUNCTION, NULL);
     curl_easy_setopt(curl, CURLOPT_READDATA, NULL);
+#ifdef HAVE_CURLOPT_SEEKFUNCTION
+    curl_easy_setopt(curl, CURLOPT_SEEKFUNCTION, NULL);
+#endif
+#ifdef HAVE_CURLOPT_SEEKDATA
+    curl_easy_setopt(curl, CURLOPT_SEEKDATA, NULL);
+#endif
     curl_easy_setopt(curl, CURLOPT_INFILESIZE, 0);
   }
 
   // set values on cleanup to nil
   //rb_easy_del("multi");
+
+  return Qnil;
+}
+
+struct easy_perform_request_restore_args {
+  VALUE self;
+  CURL *curl;
+  ruby_curl_easy *rbce;
+  int clear_customrequest;
+  int clear_nobody;
+  int clear_postfields;
+};
+
+static VALUE perform_with_request_restore_body(VALUE argp) {
+  struct easy_perform_request_restore_args *args = (struct easy_perform_request_restore_args *)argp;
+  return rb_funcall(args->self, rb_intern("perform"), 0);
+}
+
+static VALUE perform_with_request_restore_ensure(VALUE argp) {
+  struct easy_perform_request_restore_args *args = (struct easy_perform_request_restore_args *)argp;
+
+  if (args->curl) {
+    if (args->clear_nobody) {
+      curl_easy_setopt(args->curl, CURLOPT_NOBODY, 0L);
+    }
+    if (args->clear_customrequest) {
+      curl_easy_setopt(args->curl, CURLOPT_CUSTOMREQUEST, NULL);
+    }
+    if (args->clear_postfields) {
+      curl_easy_setopt(args->curl, CURLOPT_POST, 0L);
+      curl_easy_setopt(args->curl, CURLOPT_POSTFIELDS, NULL);
+      curl_easy_setopt(args->curl, CURLOPT_POSTFIELDSIZE, 0L);
+      curl_easy_setopt(args->curl, CURLOPT_HTTPGET, 1L);
+      if (args->rbce && !NIL_P(args->rbce->opts)) {
+        rb_hash_delete(args->rbce->opts, rb_easy_hkey("postdata_buffer"));
+      }
+    }
+  }
 
   return Qnil;
 }
@@ -3116,7 +4550,7 @@ static VALUE ruby_curl_easy_perform_verb_str(VALUE self, const char *verb) {
   CURL *curl;
   VALUE retval;
 
-  TypedData_Get_Struct(self, ruby_curl_easy, &ruby_curl_easy_data_type, rbce);
+  rbce = ruby_curl_easy_get_handle(self);
   curl = rbce->curl;
 
   memset(rbce->err_buf, 0, CURL_ERROR_SIZE);
@@ -3140,13 +4574,9 @@ static VALUE ruby_curl_easy_perform_verb_str(VALUE self, const char *verb) {
     curl_easy_setopt(curl, CURLOPT_POST, 0L);
   }
 
-  retval = rb_funcall(self, rb_intern("perform"), 0);
-
-  /* Restore state after request. */
-  if (is_head) {
-    curl_easy_setopt(curl, CURLOPT_NOBODY, 0L);
-  }
-  curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, NULL);
+  struct easy_perform_request_restore_args restore_args = { self, curl, rbce, 1, is_head, 0 };
+  retval = rb_ensure(perform_with_request_restore_body, (VALUE)&restore_args,
+                     perform_with_request_restore_ensure, (VALUE)&restore_args);
 
   return retval;
 }
@@ -3177,19 +4607,103 @@ static VALUE call_easy_perform(VALUE self) {
 }
 
 struct easy_form_perform_args {
+  VALUE self;
   CURL *curl;
+  int argc;
+  VALUE *argv;
   struct curl_httppost *first;
+  struct curl_httppost *last;
+  int clear_customrequest;
+  int form_set_on_curl;
+  ruby_curl_form_string *strings;
+  ruby_curl_easy *rbce;
 };
+
+struct easy_join_args {
+  VALUE args_ary;
+};
+
+static VALUE join_easy_arguments_body(VALUE argp) {
+  struct easy_join_args *args = (struct easy_join_args *)argp;
+  return rb_funcall(args->args_ary, idJoin, 1, rbstrAmp);
+}
+
+static VALUE join_easy_arguments(ruby_curl_easy *rbce, VALUE args_ary) {
+  struct easy_join_args args = { args_ary };
+
+  ruby_curl_easy_enter_native(rbce);
+  return rb_ensure(join_easy_arguments_body, (VALUE)&args,
+                   ruby_curl_easy_leave_native, (VALUE)rbce);
+}
+
+static void append_multipart_form_argument(VALUE arg,
+                                           struct curl_httppost **first,
+                                           struct curl_httppost **last,
+                                           ruby_curl_form_string **strings) {
+  if (rb_obj_is_instance_of(arg, cCurlPostField)) {
+    append_to_form(arg, first, last, strings);
+  } else if (rb_type(arg) == T_ARRAY) {
+    long j, argv_len = RARRAY_LEN(arg);
+    for (j = 0; j < argv_len; ++j) {
+      VALUE field = rb_ary_entry(arg, j);
+      if (rb_obj_is_instance_of(field, cCurlPostField)) {
+        append_to_form(field, first, last, strings);
+      } else {
+        rb_raise(eCurlErrInvalidPostField,
+                 "You must use PostFields only with multipart form posts");
+      }
+    }
+  } else {
+    rb_raise(eCurlErrInvalidPostField,
+             "You must use PostFields only with multipart form posts");
+  }
+}
+
+static VALUE build_and_perform_multipart_form(VALUE argp) {
+  struct easy_form_perform_args *args = (struct easy_form_perform_args *)argp;
+  int i;
+  ruby_curl_easy *rbce;
+
+  rbce = ruby_curl_easy_get_handle(args->self);
+  args->rbce = rbce;
+  ruby_curl_easy_enter_native(rbce);
+  rbce->multipart_building = 1;
+
+  for (i = 0; i < args->argc; i++) {
+    append_multipart_form_argument(args->argv[i], &args->first, &args->last, &args->strings);
+  }
+
+  curl_easy_setopt(args->curl, CURLOPT_POST, 0);
+  curl_easy_setopt(args->curl, CURLOPT_HTTPPOST, args->first);
+  args->form_set_on_curl = 1;
+  rbce->multipart_form_active = 1;
+
+  rbce->multipart_building = 0;
+  return call_easy_perform(args->self);
+}
 
 static VALUE ensure_free_form_post(VALUE argp) {
   struct easy_form_perform_args *args = (struct easy_form_perform_args *)argp;
+  if (args->rbce) args->rbce->multipart_building = 0;
   if (args->curl) {
-    curl_easy_setopt(args->curl, CURLOPT_HTTPPOST, NULL);
+    if (args->form_set_on_curl) {
+      ruby_curl_easy *rbce;
+      rbce = ruby_curl_easy_get_handle(args->self);
+      curl_easy_setopt(args->curl, CURLOPT_HTTPPOST, NULL);
+      rbce->multipart_form_active = 0;
+    }
+    if (args->clear_customrequest) {
+      curl_easy_setopt(args->curl, CURLOPT_CUSTOMREQUEST, NULL);
+    }
   }
   if (args->first) {
     curl_formfree(args->first);
     args->first = NULL;
   }
+  args->last = NULL;
+  free_form_strings(args->strings);
+  args->strings = NULL;
+  if (args->rbce) ruby_curl_easy_leave_native((VALUE)args->rbce);
   return Qnil;
 }
 
@@ -3220,12 +4734,11 @@ static VALUE ensure_free_form_post(VALUE argp) {
 static VALUE ruby_curl_easy_perform_post(int argc, VALUE *argv, VALUE self) {
   ruby_curl_easy *rbce;
   CURL *curl;
-  int i;
   VALUE args_ary;
 
   rb_scan_args(argc, argv, "*", &args_ary);
 
-  TypedData_Get_Struct(self, ruby_curl_easy, &ruby_curl_easy_data_type, rbce);
+  rbce = ruby_curl_easy_get_handle(self);
   curl = rbce->curl;
 
   memset(rbce->err_buf, 0, CURL_ERROR_SIZE);
@@ -3234,39 +4747,14 @@ static VALUE ruby_curl_easy_perform_post(int argc, VALUE *argv, VALUE self) {
 
   if (rbce->multipart_form_post) {
     VALUE ret;
-    struct curl_httppost *first = NULL, *last = NULL;
-
-    // Make the multipart form
-    for (i = 0; i < argc; i++) {
-      if (rb_obj_is_instance_of(argv[i], cCurlPostField)) {
-        append_to_form(argv[i], &first, &last);
-      } else if (rb_type(argv[i]) == T_ARRAY) {
-        // see: https://github.com/rvanlieshout/curb/commit/8bcdefddc0162484681ebd1a92d52a642666a445
-        long c = 0, argv_len = RARRAY_LEN(argv[i]);
-        for (; c < argv_len; ++c) {
-          if (rb_obj_is_instance_of(rb_ary_entry(argv[i],c), cCurlPostField)) {
-            append_to_form(rb_ary_entry(argv[i],c), &first, &last);
-          } else {
-            rb_raise(eCurlErrInvalidPostField, "You must use PostFields only with multipart form posts");
-            return Qnil;
-          }
-        }
-      } else {
-        rb_raise(eCurlErrInvalidPostField, "You must use PostFields only with multipart form posts");
-        return Qnil;
-      }
-    }
-
-    curl_easy_setopt(curl, CURLOPT_POST, 0);
-    curl_easy_setopt(curl, CURLOPT_HTTPPOST, first);
-    struct easy_form_perform_args perform_args = { curl, first };
-    ret = rb_ensure(call_easy_perform, self, ensure_free_form_post, (VALUE)&perform_args);
+    struct easy_form_perform_args perform_args = { self, curl, argc, argv, NULL, NULL, 0, 0, NULL, NULL };
+    ret = rb_ensure(build_and_perform_multipart_form, (VALUE)&perform_args, ensure_free_form_post, (VALUE)&perform_args);
 
     return ret;
   } else {
     VALUE post_body = Qnil;
     /* TODO: check for PostField.file and raise error before to_s fails */
-    if ((post_body = rb_funcall(args_ary, idJoin, 1, rbstrAmp)) == Qnil) {
+    if ((post_body = join_easy_arguments(rbce, args_ary)) == Qnil) {
       rb_raise(eCurlErrError, "Failed to join arguments");
       return Qnil;
     } else {
@@ -3281,7 +4769,9 @@ static VALUE ruby_curl_easy_perform_post(int argc, VALUE *argv, VALUE self) {
         ruby_curl_easy_post_body_set(self, post_body);
       }
 
-      return rb_funcall(self, rb_intern("perform"), 0);
+      struct easy_perform_request_restore_args restore_args = { self, curl, rbce, 1, 0, 0 };
+      return rb_ensure(perform_with_request_restore_body, (VALUE)&restore_args,
+                       perform_with_request_restore_ensure, (VALUE)&restore_args);
     }
   }
 }
@@ -3304,11 +4794,10 @@ static VALUE ruby_curl_easy_perform_post(int argc, VALUE *argv, VALUE self) {
 static VALUE ruby_curl_easy_perform_patch(int argc, VALUE *argv, VALUE self) {
   ruby_curl_easy *rbce;
   CURL *curl;
-  int i;
   VALUE args_ary;
 
   rb_scan_args(argc, argv, "*", &args_ary);
-  TypedData_Get_Struct(self, ruby_curl_easy, &ruby_curl_easy_data_type, rbce);
+  rbce = ruby_curl_easy_get_handle(self);
   curl = rbce->curl;
 
   /* Clear the error buffer */
@@ -3319,39 +4808,12 @@ static VALUE ruby_curl_easy_perform_patch(int argc, VALUE *argv, VALUE self) {
 
   if (rbce->multipart_form_post) {
     VALUE ret;
-    struct curl_httppost *first = NULL, *last = NULL;
-
-    /* Build the multipart form (same logic as for POST) */
-    for (i = 0; i < argc; i++) {
-      if (rb_obj_is_instance_of(argv[i], cCurlPostField)) {
-        append_to_form(argv[i], &first, &last);
-      } else if (rb_type(argv[i]) == T_ARRAY) {
-        long j, argv_len = RARRAY_LEN(argv[i]);
-        for (j = 0; j < argv_len; ++j) {
-          if (rb_obj_is_instance_of(rb_ary_entry(argv[i], j), cCurlPostField)) {
-            append_to_form(rb_ary_entry(argv[i], j), &first, &last);
-          } else {
-            rb_raise(eCurlErrInvalidPostField,
-                     "You must use PostFields only with multipart form posts");
-            return Qnil;
-          }
-        }
-      } else {
-        rb_raise(eCurlErrInvalidPostField,
-                 "You must use PostFields only with multipart form posts");
-        return Qnil;
-      }
-    }
-    /* Disable the POST flag */
-    curl_easy_setopt(curl, CURLOPT_POST, 0);
-    /* Use the built multipart form as the request body */
-    curl_easy_setopt(curl, CURLOPT_HTTPPOST, first);
-    struct easy_form_perform_args perform_args = { curl, first };
-    ret = rb_ensure(call_easy_perform, self, ensure_free_form_post, (VALUE)&perform_args);
+    struct easy_form_perform_args perform_args = { self, curl, argc, argv, NULL, NULL, 1, 0, NULL, NULL };
+    ret = rb_ensure(build_and_perform_multipart_form, (VALUE)&perform_args, ensure_free_form_post, (VALUE)&perform_args);
     return ret;
   } else {
     /* Join arguments into a raw PATCH body */
-    VALUE patch_body = rb_funcall(args_ary, idJoin, 1, rbstrAmp);
+    VALUE patch_body = join_easy_arguments(rbce, args_ary);
     if (patch_body == Qnil) {
       rb_raise(eCurlErrError, "Failed to join arguments");
       return Qnil;
@@ -3363,7 +4825,9 @@ static VALUE ruby_curl_easy_perform_patch(int argc, VALUE *argv, VALUE self) {
       if (rb_easy_nil("postdata_buffer")) {
         ruby_curl_easy_post_body_set(self, patch_body);
       }
-      return rb_funcall(self, rb_intern("perform"), 0);
+      struct easy_perform_request_restore_args restore_args = { self, curl, rbce, 1, 0, 1 };
+      return rb_ensure(perform_with_request_restore_body, (VALUE)&restore_args,
+                       perform_with_request_restore_ensure, (VALUE)&restore_args);
     }
   }
 }
@@ -3380,10 +4844,9 @@ static VALUE ruby_curl_easy_perform_put(int argc, VALUE *argv, VALUE self) {
   ruby_curl_easy *rbce;
   CURL *curl;
   VALUE args_ary;
-  int i;
 
   rb_scan_args(argc, argv, "*", &args_ary);
-  TypedData_Get_Struct(self, ruby_curl_easy, &ruby_curl_easy_data_type, rbce);
+  rbce = ruby_curl_easy_get_handle(self);
   curl = rbce->curl;
 
   memset(rbce->err_buf, 0, CURL_ERROR_SIZE);
@@ -3403,44 +4866,21 @@ static VALUE ruby_curl_easy_perform_put(int argc, VALUE *argv, VALUE self) {
   /* Otherwise, if multipart_form_post is true, use multipart logic */
   else if (rbce->multipart_form_post) {
     VALUE ret;
-    struct curl_httppost *first = NULL, *last = NULL;
-    for (i = 0; i < RARRAY_LEN(args_ary); i++) {
-      VALUE field = rb_ary_entry(args_ary, i);
-      if (rb_obj_is_instance_of(field, cCurlPostField)) {
-        append_to_form(field, &first, &last);
-      } else if (rb_type(field) == T_ARRAY) {
-        long j;
-        for (j = 0; j < RARRAY_LEN(field); j++) {
-          VALUE subfield = rb_ary_entry(field, j);
-          if (rb_obj_is_instance_of(subfield, cCurlPostField)) {
-            append_to_form(subfield, &first, &last);
-          } else {
-            rb_raise(eCurlErrInvalidPostField,
-                     "You must use PostFields only with multipart form posts");
-          }
-        }
-      } else {
-        rb_raise(eCurlErrInvalidPostField,
-                 "You must use PostFields only with multipart form posts");
-      }
-    }
-    curl_easy_setopt(curl, CURLOPT_POST, 0);
-    curl_easy_setopt(curl, CURLOPT_HTTPPOST, first);
-    /* Set the method explicitly to PUT */
-    curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, "PUT");
-    struct easy_form_perform_args perform_args = { curl, first };
-    ret = rb_ensure(call_easy_perform, self, ensure_free_form_post, (VALUE)&perform_args);
+    struct easy_form_perform_args perform_args = { self, curl, argc, argv, NULL, NULL, 1, 0, NULL, NULL };
+    ret = rb_ensure(build_and_perform_multipart_form, (VALUE)&perform_args, ensure_free_form_post, (VALUE)&perform_args);
     return ret;
   }
   /* Fallback: join all arguments */
   else {
-    VALUE post_body = rb_funcall(args_ary, idJoin, 1, rbstrAmp);
+    VALUE post_body = join_easy_arguments(rbce, args_ary);
     if (post_body != Qnil && rb_type(post_body) == T_STRING &&
         RSTRING_LEN(post_body) > 0) {
       ruby_curl_easy_put_data_set(self, post_body);
     }
   }
-  return rb_funcall(self, rb_intern("perform"), 0);
+  struct easy_perform_request_restore_args restore_args = { self, curl, rbce, 1, 0, 0 };
+  return rb_ensure(perform_with_request_restore_body, (VALUE)&restore_args,
+                   perform_with_request_restore_ensure, (VALUE)&restore_args);
 }
 
 
@@ -3460,6 +4900,47 @@ static VALUE ruby_curl_easy_body_str_get(VALUE self) {
      Content-Type: application/json; charset=utf-8
   */
   CURB_OBJECT_HGETTER(ruby_curl_easy, body_data);
+}
+
+/*
+ * call-seq:
+ *   easy.max_body_bytes = bytes_or_nil                  => bytes_or_nil
+ *
+ * Set an application-level cap for bytes accepted by the body write callback.
+ * +nil+ or 0 clears the cap.
+ */
+static VALUE ruby_curl_easy_max_body_bytes_set(VALUE self, VALUE val) {
+  ruby_curl_easy *rbce;
+  long long limit;
+
+  rbce = ruby_curl_easy_get_handle(self);
+
+  if (NIL_P(val)) {
+    rb_hash_delete(rbce->opts, rb_easy_hkey("max_body_bytes"));
+    return Qnil;
+  }
+
+  limit = NUM2LL(val);
+  if (limit < 0) {
+    rb_raise(rb_eArgError, "max_body_bytes must be greater than or equal to zero");
+  }
+
+  if (limit == 0) {
+    rb_hash_delete(rbce->opts, rb_easy_hkey("max_body_bytes"));
+  } else {
+    val = LL2NUM(limit);
+    rb_hash_aset(rbce->opts, rb_easy_hkey("max_body_bytes"), val);
+  }
+
+  return val;
+}
+
+/*
+ * call-seq:
+ *   easy.max_body_bytes                                => bytes_or_nil
+ */
+static VALUE ruby_curl_easy_max_body_bytes_get(VALUE self) {
+  CURB_OBJECT_HGETTER(ruby_curl_easy, max_body_bytes);
 }
 
 /*
@@ -3487,10 +4968,10 @@ static VALUE ruby_curl_easy_header_str_get(VALUE self) {
  */
 static VALUE ruby_curl_easy_last_effective_url_get(VALUE self) {
   ruby_curl_easy *rbce;
-  char* url;
+  char* url = NULL;
 
-  TypedData_Get_Struct(self, ruby_curl_easy, &ruby_curl_easy_data_type, rbce);
-  curl_easy_getinfo(rbce->curl, CURLINFO_EFFECTIVE_URL, &url);
+  rbce = ruby_curl_easy_get_handle(self);
+  CURB_GETINFO(rbce->curl, CURLINFO_EFFECTIVE_URL, &url);
 
   if (url && url[0]) {    // curl returns empty string if none
     return rb_str_new2(url);
@@ -3510,14 +4991,14 @@ static VALUE ruby_curl_easy_last_effective_url_get(VALUE self) {
  */
 static VALUE ruby_curl_easy_response_code_get(VALUE self) {
   ruby_curl_easy *rbce;
-  long code;
+  long code = 0;
 
-  TypedData_Get_Struct(self, ruby_curl_easy, &ruby_curl_easy_data_type, rbce);
+  rbce = ruby_curl_easy_get_handle(self);
 #ifdef HAVE_CURLINFO_RESPONSE_CODE
-  curl_easy_getinfo(rbce->curl, CURLINFO_RESPONSE_CODE, &code);
+  CURB_GETINFO(rbce->curl, CURLINFO_RESPONSE_CODE, &code);
 #else
   // old libcurl
-  curl_easy_getinfo(rbce->curl, CURLINFO_HTTP_CODE, &code);
+  CURB_GETINFO(rbce->curl, CURLINFO_HTTP_CODE, &code);
 #endif
 
   return LONG2NUM(code);
@@ -3534,10 +5015,10 @@ static VALUE ruby_curl_easy_response_code_get(VALUE self) {
  */
 static VALUE ruby_curl_easy_primary_ip_get(VALUE self) {
   ruby_curl_easy *rbce;
-  char* ip;
+  char* ip = NULL;
 
-  TypedData_Get_Struct(self, ruby_curl_easy, &ruby_curl_easy_data_type, rbce);
-  curl_easy_getinfo(rbce->curl, CURLINFO_PRIMARY_IP, &ip);
+  rbce = ruby_curl_easy_get_handle(self);
+  CURB_GETINFO(rbce->curl, CURLINFO_PRIMARY_IP, &ip);
 
   if (ip && ip[0]) {    // curl returns empty string if none
     return rb_str_new2(ip);
@@ -3555,10 +5036,10 @@ static VALUE ruby_curl_easy_primary_ip_get(VALUE self) {
  */
 static VALUE ruby_curl_easy_http_connect_code_get(VALUE self) {
   ruby_curl_easy *rbce;
-  long code;
+  long code = 0;
 
-  TypedData_Get_Struct(self, ruby_curl_easy, &ruby_curl_easy_data_type, rbce);
-  curl_easy_getinfo(rbce->curl, CURLINFO_HTTP_CONNECTCODE, &code);
+  rbce = ruby_curl_easy_get_handle(self);
+  CURB_GETINFO(rbce->curl, CURLINFO_HTTP_CONNECTCODE, &code);
 
   return LONG2NUM(code);
 }
@@ -3583,10 +5064,10 @@ static VALUE ruby_curl_easy_http_connect_code_get(VALUE self) {
 static VALUE ruby_curl_easy_file_time_get(VALUE self) {
 #ifdef HAVE_CURLINFO_FILETIME
   ruby_curl_easy *rbce;
-  long time;
+  long time = 0;
 
-  TypedData_Get_Struct(self, ruby_curl_easy, &ruby_curl_easy_data_type, rbce);
-  curl_easy_getinfo(rbce->curl, CURLINFO_FILETIME, &time);
+  rbce = ruby_curl_easy_get_handle(self);
+  CURB_GETINFO(rbce->curl, CURLINFO_FILETIME, &time);
 
   return LONG2NUM(time);
 #else
@@ -3604,10 +5085,10 @@ static VALUE ruby_curl_easy_file_time_get(VALUE self) {
  */
 static VALUE ruby_curl_easy_total_time_get(VALUE self) {
   ruby_curl_easy *rbce;
-  double time;
+  double time = 0;
 
-  TypedData_Get_Struct(self, ruby_curl_easy, &ruby_curl_easy_data_type, rbce);
-  curl_easy_getinfo(rbce->curl, CURLINFO_TOTAL_TIME, &time);
+  rbce = ruby_curl_easy_get_handle(self);
+  CURB_GETINFO(rbce->curl, CURLINFO_TOTAL_TIME, &time);
 
   return rb_float_new(time);
 }
@@ -3621,10 +5102,10 @@ static VALUE ruby_curl_easy_total_time_get(VALUE self) {
  */
 static VALUE ruby_curl_easy_name_lookup_time_get(VALUE self) {
   ruby_curl_easy *rbce;
-  double time;
+  double time = 0;
 
-  TypedData_Get_Struct(self, ruby_curl_easy, &ruby_curl_easy_data_type, rbce);
-  curl_easy_getinfo(rbce->curl, CURLINFO_NAMELOOKUP_TIME, &time);
+  rbce = ruby_curl_easy_get_handle(self);
+  CURB_GETINFO(rbce->curl, CURLINFO_NAMELOOKUP_TIME, &time);
 
   return rb_float_new(time);
 }
@@ -3638,10 +5119,10 @@ static VALUE ruby_curl_easy_name_lookup_time_get(VALUE self) {
  */
 static VALUE ruby_curl_easy_connect_time_get(VALUE self) {
   ruby_curl_easy *rbce;
-  double time;
+  double time = 0;
 
-  TypedData_Get_Struct(self, ruby_curl_easy, &ruby_curl_easy_data_type, rbce);
-  curl_easy_getinfo(rbce->curl, CURLINFO_CONNECT_TIME, &time);
+  rbce = ruby_curl_easy_get_handle(self);
+  CURB_GETINFO(rbce->curl, CURLINFO_CONNECT_TIME, &time);
 
   return rb_float_new(time);
 }
@@ -3659,10 +5140,10 @@ static VALUE ruby_curl_easy_connect_time_get(VALUE self) {
 #if defined(HAVE_CURLINFO_APPCONNECT_TIME)
 static VALUE ruby_curl_easy_app_connect_time_get(VALUE self) {
   ruby_curl_easy *rbce;
-  double time;
+  double time = 0;
 
-  TypedData_Get_Struct(self, ruby_curl_easy, &ruby_curl_easy_data_type, rbce);
-  curl_easy_getinfo(rbce->curl, CURLINFO_APPCONNECT_TIME, &time);
+  rbce = ruby_curl_easy_get_handle(self);
+  CURB_GETINFO(rbce->curl, CURLINFO_APPCONNECT_TIME, &time);
 
   return rb_float_new(time);
 }
@@ -3680,10 +5161,10 @@ static VALUE ruby_curl_easy_app_connect_time_get(VALUE self) {
  */
 static VALUE ruby_curl_easy_pre_transfer_time_get(VALUE self) {
   ruby_curl_easy *rbce;
-  double time;
+  double time = 0;
 
-  TypedData_Get_Struct(self, ruby_curl_easy, &ruby_curl_easy_data_type, rbce);
-  curl_easy_getinfo(rbce->curl, CURLINFO_PRETRANSFER_TIME, &time);
+  rbce = ruby_curl_easy_get_handle(self);
+  CURB_GETINFO(rbce->curl, CURLINFO_PRETRANSFER_TIME, &time);
 
   return rb_float_new(time);
 }
@@ -3698,10 +5179,10 @@ static VALUE ruby_curl_easy_pre_transfer_time_get(VALUE self) {
  */
 static VALUE ruby_curl_easy_start_transfer_time_get(VALUE self) {
   ruby_curl_easy *rbce;
-  double time;
+  double time = 0;
 
-  TypedData_Get_Struct(self, ruby_curl_easy, &ruby_curl_easy_data_type, rbce);
-  curl_easy_getinfo(rbce->curl, CURLINFO_STARTTRANSFER_TIME, &time);
+  rbce = ruby_curl_easy_get_handle(self);
+  CURB_GETINFO(rbce->curl, CURLINFO_STARTTRANSFER_TIME, &time);
 
   return rb_float_new(time);
 }
@@ -3720,10 +5201,10 @@ static VALUE ruby_curl_easy_start_transfer_time_get(VALUE self) {
 static VALUE ruby_curl_easy_redirect_time_get(VALUE self) {
 #ifdef HAVE_CURLINFO_REDIRECT_TIME
   ruby_curl_easy *rbce;
-  double time;
+  double time = 0;
 
-  TypedData_Get_Struct(self, ruby_curl_easy, &ruby_curl_easy_data_type, rbce);
-  curl_easy_getinfo(rbce->curl, CURLINFO_REDIRECT_TIME, &time);
+  rbce = ruby_curl_easy_get_handle(self);
+  CURB_GETINFO(rbce->curl, CURLINFO_REDIRECT_TIME, &time);
 
   return rb_float_new(time);
 #else
@@ -3743,10 +5224,10 @@ static VALUE ruby_curl_easy_redirect_time_get(VALUE self) {
 static VALUE ruby_curl_easy_redirect_count_get(VALUE self) {
 #ifdef HAVE_CURLINFO_REDIRECT_COUNT
   ruby_curl_easy *rbce;
-  long count;
+  long count = 0;
 
-  TypedData_Get_Struct(self, ruby_curl_easy, &ruby_curl_easy_data_type, rbce);
-  curl_easy_getinfo(rbce->curl, CURLINFO_REDIRECT_COUNT, &count);
+  rbce = ruby_curl_easy_get_handle(self);
+  CURB_GETINFO(rbce->curl, CURLINFO_REDIRECT_COUNT, &count);
 
   return LONG2NUM(count);
 #else
@@ -3768,10 +5249,10 @@ static VALUE ruby_curl_easy_redirect_count_get(VALUE self) {
 static VALUE ruby_curl_easy_redirect_url_get(VALUE self) {
 #ifdef HAVE_CURLINFO_REDIRECT_URL
   ruby_curl_easy *rbce;
-  char* url;
+  char* url = NULL;
 
-  TypedData_Get_Struct(self, ruby_curl_easy, &ruby_curl_easy_data_type, rbce);
-  curl_easy_getinfo(rbce->curl, CURLINFO_REDIRECT_URL, &url);
+  rbce = ruby_curl_easy_get_handle(self);
+  CURB_GETINFO(rbce->curl, CURLINFO_REDIRECT_URL, &url);
 
   if (url && url[0]) {    // curl returns empty string if none
     return rb_str_new2(url);
@@ -3795,15 +5276,15 @@ static VALUE ruby_curl_easy_redirect_url_get(VALUE self) {
  */
 static VALUE ruby_curl_easy_uploaded_bytes_get(VALUE self) {
   ruby_curl_easy *rbce;
-  TypedData_Get_Struct(self, ruby_curl_easy, &ruby_curl_easy_data_type, rbce);
+  rbce = ruby_curl_easy_get_handle(self);
 
 #ifdef HAVE_CURLINFO_SIZE_UPLOAD_T
-  curl_off_t bytes;
-  curl_easy_getinfo(rbce->curl, CURLINFO_SIZE_UPLOAD_T, &bytes);
+  curl_off_t bytes = 0;
+  CURB_GETINFO(rbce->curl, CURLINFO_SIZE_UPLOAD_T, &bytes);
   return LL2NUM(bytes);
 #else
-  double bytes;
-  curl_easy_getinfo(rbce->curl, CURLINFO_SIZE_UPLOAD, &bytes);
+  double bytes = 0;
+  CURB_GETINFO(rbce->curl, CURLINFO_SIZE_UPLOAD, &bytes);
   return rb_float_new(bytes);
 #endif
 }
@@ -3817,15 +5298,15 @@ static VALUE ruby_curl_easy_uploaded_bytes_get(VALUE self) {
  */
 static VALUE ruby_curl_easy_downloaded_bytes_get(VALUE self) {
   ruby_curl_easy *rbce;
-  TypedData_Get_Struct(self, ruby_curl_easy, &ruby_curl_easy_data_type, rbce);
+  rbce = ruby_curl_easy_get_handle(self);
 
 #ifdef HAVE_CURLINFO_SIZE_DOWNLOAD_T
-  curl_off_t bytes;
-  curl_easy_getinfo(rbce->curl, CURLINFO_SIZE_DOWNLOAD_T, &bytes);
+  curl_off_t bytes = 0;
+  CURB_GETINFO(rbce->curl, CURLINFO_SIZE_DOWNLOAD_T, &bytes);
   return LL2NUM(bytes);
 #else
-  double bytes;
-  curl_easy_getinfo(rbce->curl, CURLINFO_SIZE_DOWNLOAD, &bytes);
+  double bytes = 0;
+  CURB_GETINFO(rbce->curl, CURLINFO_SIZE_DOWNLOAD, &bytes);
   return rb_float_new(bytes);
 #endif
 }
@@ -3839,15 +5320,15 @@ static VALUE ruby_curl_easy_downloaded_bytes_get(VALUE self) {
  */
 static VALUE ruby_curl_easy_upload_speed_get(VALUE self) {
   ruby_curl_easy *rbce;
-  TypedData_Get_Struct(self, ruby_curl_easy, &ruby_curl_easy_data_type, rbce);
+  rbce = ruby_curl_easy_get_handle(self);
 
 #ifdef HAVE_CURLINFO_SPEED_UPLOAD_T
-  curl_off_t bytes;
-  curl_easy_getinfo(rbce->curl, CURLINFO_SPEED_UPLOAD_T, &bytes);
+  curl_off_t bytes = 0;
+  CURB_GETINFO(rbce->curl, CURLINFO_SPEED_UPLOAD_T, &bytes);
   return LL2NUM(bytes);
 #else
-  double bytes;
-  curl_easy_getinfo(rbce->curl, CURLINFO_SPEED_UPLOAD, &bytes);
+  double bytes = 0;
+  CURB_GETINFO(rbce->curl, CURLINFO_SPEED_UPLOAD, &bytes);
   return rb_float_new(bytes);
 #endif
 }
@@ -3861,15 +5342,15 @@ static VALUE ruby_curl_easy_upload_speed_get(VALUE self) {
  */
 static VALUE ruby_curl_easy_download_speed_get(VALUE self) {
   ruby_curl_easy *rbce;
-  TypedData_Get_Struct(self, ruby_curl_easy, &ruby_curl_easy_data_type, rbce);
+  rbce = ruby_curl_easy_get_handle(self);
 
 #ifdef HAVE_CURLINFO_SPEED_DOWNLOAD_T
-  curl_off_t bytes;
-  curl_easy_getinfo(rbce->curl, CURLINFO_SPEED_DOWNLOAD_T, &bytes);
+  curl_off_t bytes = 0;
+  CURB_GETINFO(rbce->curl, CURLINFO_SPEED_DOWNLOAD_T, &bytes);
   return LL2NUM(bytes);
 #else
-  double bytes;
-  curl_easy_getinfo(rbce->curl, CURLINFO_SPEED_DOWNLOAD, &bytes);
+  double bytes = 0;
+  CURB_GETINFO(rbce->curl, CURLINFO_SPEED_DOWNLOAD, &bytes);
   return rb_float_new(bytes);
 #endif
 }
@@ -3883,10 +5364,10 @@ static VALUE ruby_curl_easy_download_speed_get(VALUE self) {
  */
 static VALUE ruby_curl_easy_header_size_get(VALUE self) {
   ruby_curl_easy *rbce;
-  long size;
+  long size = 0;
 
-  TypedData_Get_Struct(self, ruby_curl_easy, &ruby_curl_easy_data_type, rbce);
-  curl_easy_getinfo(rbce->curl, CURLINFO_HEADER_SIZE, &size);
+  rbce = ruby_curl_easy_get_handle(self);
+  CURB_GETINFO(rbce->curl, CURLINFO_HEADER_SIZE, &size);
 
   return LONG2NUM(size);
 }
@@ -3901,10 +5382,10 @@ static VALUE ruby_curl_easy_header_size_get(VALUE self) {
  */
 static VALUE ruby_curl_easy_request_size_get(VALUE self) {
   ruby_curl_easy *rbce;
-  long size;
+  long size = 0;
 
-  TypedData_Get_Struct(self, ruby_curl_easy, &ruby_curl_easy_data_type, rbce);
-  curl_easy_getinfo(rbce->curl, CURLINFO_REQUEST_SIZE, &size);
+  rbce = ruby_curl_easy_get_handle(self);
+  CURB_GETINFO(rbce->curl, CURLINFO_REQUEST_SIZE, &size);
 
   return LONG2NUM(size);
 }
@@ -3918,10 +5399,10 @@ static VALUE ruby_curl_easy_request_size_get(VALUE self) {
  */
 static VALUE ruby_curl_easy_ssl_verify_result_get(VALUE self) {
   ruby_curl_easy *rbce;
-  long result;
+  long result = 0;
 
-  TypedData_Get_Struct(self, ruby_curl_easy, &ruby_curl_easy_data_type, rbce);
-  curl_easy_getinfo(rbce->curl, CURLINFO_SSL_VERIFYRESULT, &result);
+  rbce = ruby_curl_easy_get_handle(self);
+  CURB_GETINFO(rbce->curl, CURLINFO_SSL_VERIFYRESULT, &result);
 
   return LONG2NUM(result);
 }
@@ -3943,15 +5424,15 @@ NOTE: you must call curl_slist_free_all(3) on the list pointer once you're done 
  */
 static VALUE ruby_curl_easy_downloaded_content_length_get(VALUE self) {
   ruby_curl_easy *rbce;
-  TypedData_Get_Struct(self, ruby_curl_easy, &ruby_curl_easy_data_type, rbce);
+  rbce = ruby_curl_easy_get_handle(self);
 
 #ifdef HAVE_CURLINFO_CONTENT_LENGTH_DOWNLOAD_T
-  curl_off_t bytes;
-  curl_easy_getinfo(rbce->curl, CURLINFO_CONTENT_LENGTH_DOWNLOAD_T, &bytes);
+  curl_off_t bytes = 0;
+  CURB_GETINFO(rbce->curl, CURLINFO_CONTENT_LENGTH_DOWNLOAD_T, &bytes);
   return LL2NUM(bytes);
 #else
-  double bytes;
-  curl_easy_getinfo(rbce->curl, CURLINFO_CONTENT_LENGTH_DOWNLOAD, &bytes);
+  double bytes = 0;
+  CURB_GETINFO(rbce->curl, CURLINFO_CONTENT_LENGTH_DOWNLOAD, &bytes);
   return rb_float_new(bytes);
 #endif
 }
@@ -3964,15 +5445,15 @@ static VALUE ruby_curl_easy_downloaded_content_length_get(VALUE self) {
  */
 static VALUE ruby_curl_easy_uploaded_content_length_get(VALUE self) {
   ruby_curl_easy *rbce;
-  TypedData_Get_Struct(self, ruby_curl_easy, &ruby_curl_easy_data_type, rbce);
+  rbce = ruby_curl_easy_get_handle(self);
 
 #ifdef HAVE_CURLINFO_CONTENT_LENGTH_UPLOAD_T
-  curl_off_t bytes;
-  curl_easy_getinfo(rbce->curl, CURLINFO_CONTENT_LENGTH_UPLOAD_T, &bytes);
+  curl_off_t bytes = 0;
+  CURB_GETINFO(rbce->curl, CURLINFO_CONTENT_LENGTH_UPLOAD_T, &bytes);
   return LL2NUM(bytes);
 #else
-  double bytes;
-  curl_easy_getinfo(rbce->curl, CURLINFO_CONTENT_LENGTH_UPLOAD, &bytes);
+  double bytes = 0;
+  CURB_GETINFO(rbce->curl, CURLINFO_CONTENT_LENGTH_UPLOAD, &bytes);
   return rb_float_new(bytes);
 #endif
 }
@@ -3988,10 +5469,10 @@ static VALUE ruby_curl_easy_uploaded_content_length_get(VALUE self) {
  */
 static VALUE ruby_curl_easy_content_type_get(VALUE self) {
   ruby_curl_easy *rbce;
-  char* type;
+  char* type = NULL;
 
-  TypedData_Get_Struct(self, ruby_curl_easy, &ruby_curl_easy_data_type, rbce);
-  curl_easy_getinfo(rbce->curl, CURLINFO_CONTENT_TYPE, &type);
+  rbce = ruby_curl_easy_get_handle(self);
+  CURB_GETINFO(rbce->curl, CURLINFO_CONTENT_TYPE, &type);
 
   if (type && type[0]) {    // curl returns empty string if none
     return rb_str_new2(type);
@@ -4031,10 +5512,10 @@ Pass a pointer to a long to receive a bitmask indicating the authentication meth
 static VALUE ruby_curl_easy_os_errno_get(VALUE self) {
 #ifdef HAVE_CURLINFO_OS_ERRNO
   ruby_curl_easy *rbce;
-  long result;
+  long result = 0;
 
-  TypedData_Get_Struct(self, ruby_curl_easy, &ruby_curl_easy_data_type, rbce);
-  curl_easy_getinfo(rbce->curl, CURLINFO_OS_ERRNO, &result);
+  rbce = ruby_curl_easy_get_handle(self);
+  CURB_GETINFO(rbce->curl, CURLINFO_OS_ERRNO, &result);
 
   return LONG2NUM(result);
 #else
@@ -4060,10 +5541,10 @@ static VALUE ruby_curl_easy_os_errno_get(VALUE self) {
 static VALUE ruby_curl_easy_num_connects_get(VALUE self) {
 #ifdef HAVE_CURLINFO_NUM_CONNECTS
   ruby_curl_easy *rbce;
-  long result;
+  long result = 0;
 
-  TypedData_Get_Struct(self, ruby_curl_easy, &ruby_curl_easy_data_type, rbce);
-  curl_easy_getinfo(rbce->curl, CURLINFO_NUM_CONNECTS, &result);
+  rbce = ruby_curl_easy_get_handle(self);
+  CURB_GETINFO(rbce->curl, CURLINFO_NUM_CONNECTS, &result);
 
   return LONG2NUM(result);
 #else
@@ -4095,12 +5576,12 @@ static VALUE ruby_curl_easy_num_connects_get(VALUE self) {
 static VALUE ruby_curl_easy_cookielist_get(VALUE self) {
 #ifdef HAVE_CURLINFO_COOKIELIST
   ruby_curl_easy *rbce;
-  struct curl_slist *cookies;
+  struct curl_slist *cookies = NULL;
   struct curl_slist *cookie;
   VALUE rb_cookies;
 
-  TypedData_Get_Struct(self, ruby_curl_easy, &ruby_curl_easy_data_type, rbce);
-  curl_easy_getinfo(rbce->curl, CURLINFO_COOKIELIST, &cookies);
+  rbce = ruby_curl_easy_get_handle(self);
+  CURB_GETINFO(rbce->curl, CURLINFO_COOKIELIST, &cookies);
   if (!cookies)
     return Qnil;
   rb_cookies = rb_ary_new();
@@ -4139,8 +5620,8 @@ static VALUE ruby_curl_easy_ftp_entry_path_get(VALUE self) {
   ruby_curl_easy *rbce;
   char* path = NULL;
 
-  TypedData_Get_Struct(self, ruby_curl_easy, &ruby_curl_easy_data_type, rbce);
-  curl_easy_getinfo(rbce->curl, CURLINFO_FTP_ENTRY_PATH, &path);
+  rbce = ruby_curl_easy_get_handle(self);
+  CURB_GETINFO(rbce->curl, CURLINFO_FTP_ENTRY_PATH, &path);
 
   if (path && path[0]) {    // curl returns NULL or empty string if none
     return rb_str_new2(path);
@@ -4159,7 +5640,7 @@ static VALUE ruby_curl_easy_ftp_entry_path_get(VALUE self) {
  */
 static VALUE ruby_curl_easy_multi_get(VALUE self) {
   ruby_curl_easy *rbce;
-  TypedData_Get_Struct(self, ruby_curl_easy, &ruby_curl_easy_data_type, rbce);
+  rbce = ruby_curl_easy_get_handle(self);
   return rbce->multi;
 }
 
@@ -4169,10 +5650,26 @@ static VALUE ruby_curl_easy_multi_get(VALUE self) {
  */
 static VALUE ruby_curl_easy_multi_set(VALUE self, VALUE multi) {
   ruby_curl_easy *rbce;
-  TypedData_Get_Struct(self, ruby_curl_easy, &ruby_curl_easy_data_type, rbce);
+  VALUE old_multi;
+  ruby_curl_multi *old_rbcm;
+  CURLMcode result;
+  rbce = ruby_curl_easy_get_handle(self);
 
   if (!NIL_P(multi) && rb_obj_is_kind_of(multi, cCurlMulti) != Qtrue) {
     rb_raise(rb_eTypeError, "expected Curl::Multi or nil");
+  }
+
+  old_multi = rbce->multi;
+  if (old_multi == multi) {
+    return rbce->multi;
+  }
+
+  old_rbcm = ruby_curl_multi_pointer_if_compatible(old_multi);
+  if (old_rbcm) {
+    result = rb_curl_multi_detach_easy(old_rbcm, rbce);
+    if (result != CURLM_OK) {
+      raise_curl_multi_error_exception(result);
+    }
   }
 
   rbce->multi = multi;
@@ -4185,7 +5682,7 @@ static VALUE ruby_curl_easy_multi_set(VALUE self, VALUE multi) {
  */
 static VALUE ruby_curl_easy_last_result(VALUE self) {
   ruby_curl_easy *rbce;
-  TypedData_Get_Struct(self, ruby_curl_easy, &ruby_curl_easy_data_type, rbce);
+  rbce = ruby_curl_easy_get_handle(self);
   return LONG2NUM(rbce->last_result);
 }
 
@@ -4195,7 +5692,7 @@ static VALUE ruby_curl_easy_last_result(VALUE self) {
  */
 static VALUE ruby_curl_easy_last_error(VALUE self) {
   ruby_curl_easy *rbce;
-  TypedData_Get_Struct(self, ruby_curl_easy, &ruby_curl_easy_data_type, rbce);
+  rbce = ruby_curl_easy_get_handle(self);
 
   if (rbce->err_buf[0]) {    // curl returns NULL or empty string if none
     return rb_str_new2(rbce->err_buf);
@@ -4217,12 +5714,24 @@ static VALUE ruby_curl_easy_last_error(VALUE self) {
  * @note Some options - like url or cookie - aren't set directly throught +curl_easy_setopt+, but stored in the Ruby object state.
  * @note When +curl_easy_setopt+ is called, return value is not checked here.
  */
+static long ruby_curl_easy_option_to_long(VALUE value) {
+  if (value == Qtrue) {
+    return 1L;
+  }
+  if (value == Qfalse) {
+    return 0L;
+  }
+
+  return NUM2LONG(rb_funcall(value, rb_intern("to_i"), 0));
+}
+
 static VALUE ruby_curl_easy_set_opt(VALUE self, VALUE opt, VALUE val) {
   ruby_curl_easy *rbce;
   long option = NUM2LONG(opt);
   rb_io_t *open_f_ptr;
 
-  TypedData_Get_Struct(self, ruby_curl_easy, &ruby_curl_easy_data_type, rbce);
+  rbce = ruby_curl_easy_get_handle(self);
+  ruby_curl_easy_check_idle(rbce);
 
   switch (option) {
   /* BEHAVIOR OPTIONS */
@@ -4320,65 +5829,88 @@ static VALUE ruby_curl_easy_set_opt(VALUE self, VALUE opt, VALUE val) {
     curl_easy_setopt(rbce->curl, CURLOPT_REQUEST_TARGET, NIL_P(val) ? NULL : StringValueCStr(val));
     } break;
 #endif
+#ifdef HAVE_CURLOPT_DOH_URL
+  case CURLOPT_DOH_URL: {
+    rb_hash_aset(rbce->opts, rb_easy_hkey("doh_url"), val);
+    curl_easy_setopt(rbce->curl, CURLOPT_DOH_URL, NIL_P(val) ? NULL : StringValueCStr(val));
+    } break;
+#endif
   case CURLOPT_TCP_NODELAY: {
     curl_easy_setopt(rbce->curl, CURLOPT_TCP_NODELAY, NUM2LONG(val));
     } break;
   /* FTP-specific toggles */
 #ifdef HAVE_CURLOPT_DIRLISTONLY
   case CURLOPT_DIRLISTONLY: {
-    int type = rb_type(val);
-    VALUE value;
-    if (type == T_TRUE) {
-      value = rb_int_new(1);
-    } else if (type == T_FALSE) {
-      value = rb_int_new(0);
-    } else {
-      value = rb_funcall(val, rb_intern("to_i"), 0);
-    }
-    curl_easy_setopt(rbce->curl, CURLOPT_DIRLISTONLY, NUM2LONG(value));
+    curl_easy_setopt(rbce->curl, CURLOPT_DIRLISTONLY, ruby_curl_easy_option_to_long(val));
     } break;
+#endif
+#ifdef HAVE_CURLOPT_FTPPORT
+  case CURLOPT_FTPPORT:
+    curl_easy_setopt(rbce->curl, CURLOPT_FTPPORT, NIL_P(val) ? NULL : StringValueCStr(val));
+    break;
+#endif
+#ifdef HAVE_CURLOPT_APPEND
+  case CURLOPT_APPEND:
+    curl_easy_setopt(rbce->curl, CURLOPT_APPEND, ruby_curl_easy_option_to_long(val));
+    break;
 #endif
 #ifdef HAVE_CURLOPT_FTP_USE_EPSV
-  case CURLOPT_FTP_USE_EPSV: {
-    int type = rb_type(val);
-    VALUE value;
-    if (type == T_TRUE) {
-      value = rb_int_new(1);
-    } else if (type == T_FALSE) {
-      value = rb_int_new(0);
-    } else {
-      value = rb_funcall(val, rb_intern("to_i"), 0);
-    }
-    curl_easy_setopt(rbce->curl, CURLOPT_FTP_USE_EPSV, NUM2LONG(value));
-    } break;
+  case CURLOPT_FTP_USE_EPSV:
+    curl_easy_setopt(rbce->curl, CURLOPT_FTP_USE_EPSV, ruby_curl_easy_option_to_long(val));
+    break;
 #endif
 #ifdef HAVE_CURLOPT_FTP_USE_EPRT
-  case CURLOPT_FTP_USE_EPRT: {
-    int type = rb_type(val);
-    VALUE value;
-    if (type == T_TRUE) {
-      value = rb_int_new(1);
-    } else if (type == T_FALSE) {
-      value = rb_int_new(0);
-    } else {
-      value = rb_funcall(val, rb_intern("to_i"), 0);
-    }
-    curl_easy_setopt(rbce->curl, CURLOPT_FTP_USE_EPRT, NUM2LONG(value));
-    } break;
+  case CURLOPT_FTP_USE_EPRT:
+    curl_easy_setopt(rbce->curl, CURLOPT_FTP_USE_EPRT, ruby_curl_easy_option_to_long(val));
+    break;
+#endif
+#ifdef HAVE_CURLOPT_FTP_USE_PRET
+  case CURLOPT_FTP_USE_PRET:
+    curl_easy_setopt(rbce->curl, CURLOPT_FTP_USE_PRET, ruby_curl_easy_option_to_long(val));
+    break;
+#endif
+#ifdef HAVE_CURLOPT_FTP_CREATE_MISSING_DIRS
+  case CURLOPT_FTP_CREATE_MISSING_DIRS:
+    rb_easy_set("ftp_create_missing_dirs", val);
+    curl_easy_setopt(rbce->curl, CURLOPT_FTP_CREATE_MISSING_DIRS, ruby_curl_easy_option_to_long(val));
+    break;
+#endif
+#ifdef HAVE_CURLOPT_FTP_RESPONSE_TIMEOUT
+  case CURLOPT_FTP_RESPONSE_TIMEOUT:
+    rbce->ftp_response_timeout = ruby_curl_easy_option_to_long(val);
+    curl_easy_setopt(rbce->curl, CURLOPT_FTP_RESPONSE_TIMEOUT, rbce->ftp_response_timeout);
+    break;
+#endif
+#ifdef HAVE_CURLOPT_FTP_ALTERNATIVE_TO_USER
+  case CURLOPT_FTP_ALTERNATIVE_TO_USER:
+    curl_easy_setopt(rbce->curl, CURLOPT_FTP_ALTERNATIVE_TO_USER, NIL_P(val) ? NULL : StringValueCStr(val));
+    break;
 #endif
 #ifdef HAVE_CURLOPT_FTP_SKIP_PASV_IP
-  case CURLOPT_FTP_SKIP_PASV_IP: {
-    int type = rb_type(val);
-    VALUE value;
-    if (type == T_TRUE) {
-      value = rb_int_new(1);
-    } else if (type == T_FALSE) {
-      value = rb_int_new(0);
-    } else {
-      value = rb_funcall(val, rb_intern("to_i"), 0);
-    }
-    curl_easy_setopt(rbce->curl, CURLOPT_FTP_SKIP_PASV_IP, NUM2LONG(value));
-    } break;
+  case CURLOPT_FTP_SKIP_PASV_IP:
+    curl_easy_setopt(rbce->curl, CURLOPT_FTP_SKIP_PASV_IP, ruby_curl_easy_option_to_long(val));
+    break;
+#endif
+#ifdef HAVE_CURLOPT_FTPSSLAUTH
+  case CURLOPT_FTPSSLAUTH:
+    curl_easy_setopt(rbce->curl, CURLOPT_FTPSSLAUTH, ruby_curl_easy_option_to_long(val));
+    break;
+#endif
+#ifdef HAVE_CURLOPT_FTP_SSL_CCC
+  case CURLOPT_FTP_SSL_CCC:
+    curl_easy_setopt(rbce->curl, CURLOPT_FTP_SSL_CCC, ruby_curl_easy_option_to_long(val));
+    break;
+#endif
+#ifdef HAVE_CURLOPT_FTP_ACCOUNT
+  case CURLOPT_FTP_ACCOUNT:
+    curl_easy_setopt(rbce->curl, CURLOPT_FTP_ACCOUNT, NIL_P(val) ? NULL : StringValueCStr(val));
+    break;
+#endif
+#ifdef HAVE_CURLOPT_FTP_FILEMETHOD
+  case CURLOPT_FTP_FILEMETHOD:
+    rbce->ftp_filemethod = ruby_curl_easy_option_to_long(val);
+    curl_easy_setopt(rbce->curl, CURLOPT_FTP_FILEMETHOD, rbce->ftp_filemethod);
+    break;
 #endif
   case CURLOPT_RANGE: {
     curl_easy_setopt(rbce->curl, CURLOPT_RANGE, StringValueCStr(val));
@@ -4393,7 +5925,9 @@ static VALUE ruby_curl_easy_set_opt(VALUE self, VALUE opt, VALUE val) {
     curl_easy_setopt(rbce->curl, CURLOPT_SSL_CIPHER_LIST, StringValueCStr(val));
     } break;
   case CURLOPT_FORBID_REUSE: {
-    curl_easy_setopt(rbce->curl, CURLOPT_FORBID_REUSE, NUM2LONG(val));
+    rbce->forbid_reuse = NUM2LONG(val);
+    rbce->forbid_reuse_set = 1;
+    curl_easy_setopt(rbce->curl, CURLOPT_FORBID_REUSE, rbce->forbid_reuse);
     } break;
 #ifdef HAVE_CURLOPT_GSSAPI_DELEGATION
   case CURLOPT_GSSAPI_DELEGATION: {
@@ -4402,7 +5936,14 @@ static VALUE ruby_curl_easy_set_opt(VALUE self, VALUE opt, VALUE val) {
 #endif
 #ifdef HAVE_CURLOPT_UNIX_SOCKET_PATH
   case CURLOPT_UNIX_SOCKET_PATH: {
-	curl_easy_setopt(rbce->curl, CURLOPT_UNIX_SOCKET_PATH, StringValueCStr(val));
+    rb_hash_aset(rbce->opts, rb_easy_hkey("unix_socket_path"), val);
+    curl_easy_setopt(rbce->curl, CURLOPT_UNIX_SOCKET_PATH, NIL_P(val) ? NULL : StringValueCStr(val));
+    } break;
+#endif
+#ifdef HAVE_CURLOPT_DNS_SERVERS
+  case CURLOPT_DNS_SERVERS: {
+    rb_hash_aset(rbce->opts, rb_easy_hkey("dns_servers"), val);
+    curl_easy_setopt(rbce->curl, CURLOPT_DNS_SERVERS, NIL_P(val) ? NULL : StringValueCStr(val));
     } break;
 #endif
 #ifdef HAVE_CURLOPT_MAX_SEND_SPEED_LARGE
@@ -4418,6 +5959,11 @@ static VALUE ruby_curl_easy_set_opt(VALUE self, VALUE opt, VALUE val) {
 #ifdef HAVE_CURLOPT_MAXFILESIZE
   case CURLOPT_MAXFILESIZE:
     curl_easy_setopt(rbce->curl, CURLOPT_MAXFILESIZE, NUM2LONG(val));
+    break;
+#endif
+#ifdef HAVE_CURLOPT_MAXFILESIZE_LARGE
+  case CURLOPT_MAXFILESIZE_LARGE:
+    curl_easy_setopt(rbce->curl, CURLOPT_MAXFILESIZE_LARGE, (curl_off_t)NUM2LL(val));
     break;
 #endif
 #ifdef HAVE_CURLOPT_TCP_KEEPALIVE
@@ -4450,6 +5996,16 @@ static VALUE ruby_curl_easy_set_opt(VALUE self, VALUE opt, VALUE val) {
   case CURLOPT_REDIR_PROTOCOLS:
     curl_easy_setopt(rbce->curl, option, NUM2LONG(val));
     break;
+#ifdef HAVE_CURLOPT_PROTOCOLS_STR
+  case CURLOPT_PROTOCOLS_STR:
+    curl_easy_setopt(rbce->curl, CURLOPT_PROTOCOLS_STR, NIL_P(val) ? NULL : StringValueCStr(val));
+    break;
+#endif
+#ifdef HAVE_CURLOPT_REDIR_PROTOCOLS_STR
+  case CURLOPT_REDIR_PROTOCOLS_STR:
+    curl_easy_setopt(rbce->curl, CURLOPT_REDIR_PROTOCOLS_STR, NIL_P(val) ? NULL : StringValueCStr(val));
+    break;
+#endif
 #ifdef HAVE_CURLOPT_SSL_SESSIONID_CACHE
   case CURLOPT_SSL_SESSIONID_CACHE:
     curl_easy_setopt(rbce->curl, CURLOPT_SSL_SESSIONID_CACHE, NUM2LONG(val));
@@ -4480,6 +6036,21 @@ static VALUE ruby_curl_easy_set_opt(VALUE self, VALUE opt, VALUE val) {
     curl_easy_setopt(rbce->curl, CURLOPT_PROXY_SSL_VERIFYHOST, NUM2LONG(val));
     break;
 #endif
+#ifdef HAVE_CURLOPT_DOH_SSL_VERIFYPEER
+  case CURLOPT_DOH_SSL_VERIFYPEER:
+    curl_easy_setopt(rbce->curl, CURLOPT_DOH_SSL_VERIFYPEER, NUM2LONG(val));
+    break;
+#endif
+#ifdef HAVE_CURLOPT_DOH_SSL_VERIFYHOST
+  case CURLOPT_DOH_SSL_VERIFYHOST:
+    curl_easy_setopt(rbce->curl, CURLOPT_DOH_SSL_VERIFYHOST, NUM2LONG(val));
+    break;
+#endif
+#ifdef HAVE_CURLOPT_DOH_SSL_VERIFYSTATUS
+  case CURLOPT_DOH_SSL_VERIFYSTATUS:
+    curl_easy_setopt(rbce->curl, CURLOPT_DOH_SSL_VERIFYSTATUS, NUM2LONG(val));
+    break;
+#endif
 #ifdef HAVE_CURLOPT_RESOLVE
   case CURLOPT_RESOLVE: {
     struct curl_slist *list = NULL;
@@ -4507,7 +6078,36 @@ static VALUE ruby_curl_easy_set_opt(VALUE self, VALUE opt, VALUE val) {
     }
     /* Save the list pointer in the ruby_curl_easy structure for cleanup later */
     rbce->curl_resolve = list;
+    rb_hash_aset(rbce->opts, rb_easy_hkey("resolve"), val);
     curl_easy_setopt(rbce->curl, CURLOPT_RESOLVE, list);
+  } break;
+#endif
+#ifdef HAVE_CURLOPT_CONNECT_TO
+  case CURLOPT_CONNECT_TO: {
+    struct curl_slist *list = NULL;
+    ruby_curl_easy_clear_connect_to_list(rbce);
+    if (NIL_P(val)) {
+      list = NULL;
+    } else if (TYPE(val) == T_ARRAY) {
+      long i, len = RARRAY_LEN(val);
+      for (i = 0; i < len; i++) {
+        VALUE item = rb_ary_entry(val, i);
+        struct curl_slist *new_list = curl_slist_append(list, StringValueCStr(item));
+        if (!new_list) {
+          curl_slist_free_all(list);
+          rb_raise(rb_eNoMemError, "Failed to append to connect-to list");
+        }
+        list = new_list;
+      }
+    } else {
+      list = curl_slist_append(NULL, StringValueCStr(val));
+      if (!list) {
+        rb_raise(rb_eNoMemError, "Failed to create connect-to list");
+      }
+    }
+    rbce->curl_connect_to = list;
+    rb_hash_aset(rbce->opts, rb_easy_hkey("connect_to"), val);
+    curl_easy_setopt(rbce->curl, CURLOPT_CONNECT_TO, list);
   } break;
 #endif
   default:
@@ -4516,6 +6116,34 @@ static VALUE ruby_curl_easy_set_opt(VALUE self, VALUE opt, VALUE val) {
 
   return val;
 }
+
+#ifdef HAVE_CURLOPT_FTP_CREATE_MISSING_DIRS
+/*
+ * call-seq:
+ *   easy.ftp_create_missing_dirs = boolean_or_mode  => boolean_or_mode
+ *
+ * Configure whether libcurl creates missing directories for an FTP or SFTP
+ * transfer. In addition to true and false, this accepts the
+ * Curl::CURLFTP_CREATE_DIR_* mode constants when provided by libcurl.
+ */
+static VALUE ruby_curl_easy_ftp_create_missing_dirs_set(VALUE self, VALUE value) {
+  return ruby_curl_easy_set_opt(
+    self,
+    LONG2NUM(CURLOPT_FTP_CREATE_MISSING_DIRS),
+    value
+  );
+}
+
+/*
+ * call-seq:
+ *   easy.ftp_create_missing_dirs  => boolean, number, or nil
+ *
+ * Return the configured missing-directory creation mode.
+ */
+static VALUE ruby_curl_easy_ftp_create_missing_dirs_get(VALUE self) {
+  CURB_OBJECT_HGETTER(ruby_curl_easy, ftp_create_missing_dirs);
+}
+#endif
 
 /*
  * call-seq:
@@ -4555,6 +6183,28 @@ static VALUE ruby_curl_easy_inspect(VALUE self) {
 
 /* ================== ESCAPING FUNCS ==============*/
 
+struct curl_string_result {
+  char *data;
+  long length;
+};
+
+static VALUE curl_string_result_body(VALUE argp) {
+  struct curl_string_result *args = (struct curl_string_result *)argp;
+  return rb_str_new(args->data, args->length);
+}
+
+static VALUE curl_string_result_free(VALUE argp) {
+  struct curl_string_result *args = (struct curl_string_result *)argp;
+  curl_free(args->data);
+  return Qnil;
+}
+
+static VALUE curl_string_result_to_ruby(char *data, long length) {
+  struct curl_string_result args = { data, length };
+  return rb_ensure(curl_string_result_body, (VALUE)&args,
+                   curl_string_result_free, (VALUE)&args);
+}
+
 /*
  * call-seq:
  *   easy.escape("some text")                         => "some%20text"
@@ -4567,13 +6217,13 @@ static VALUE ruby_curl_easy_inspect(VALUE self) {
 static VALUE ruby_curl_easy_escape(VALUE self, VALUE svalue) {
   ruby_curl_easy *rbce;
   char *result;
-  VALUE rresult;
   VALUE str = svalue;
 
-  TypedData_Get_Struct(self, ruby_curl_easy, &ruby_curl_easy_data_type, rbce);
+  rbce = ruby_curl_easy_get_handle(self);
 
-  /* NOTE: make sure the value is a string, if not call to_s */
-  if( rb_type(str) != T_STRING ) { str = rb_funcall(str,rb_intern("to_s"),0); }
+  /* NOTE: make sure the value is a string; rb_obj_as_string always yields a
+   * String, even if the object's to_s misbehaves and returns a non-String. */
+  if( rb_type(str) != T_STRING ) { str = rb_obj_as_string(str); }
 
 #if (LIBCURL_VERSION_NUM >= 0x070f04)
   result = (char*)curl_easy_escape(rbce->curl, StringValuePtr(str), (int)RSTRING_LEN(str));
@@ -4581,10 +6231,8 @@ static VALUE ruby_curl_easy_escape(VALUE self, VALUE svalue) {
   result = (char*)curl_escape(StringValuePtr(str), (int)RSTRING_LEN(str));
 #endif
 
-  rresult = rb_str_new2(result);
-  curl_free(result);
-
-  return rresult;
+  if (!result) rb_raise(eCurlErrError, "Failed to URL-encode string");
+  return curl_string_result_to_ruby(result, (long)strlen(result));
 }
 
 /*
@@ -4599,21 +6247,25 @@ static VALUE ruby_curl_easy_unescape(VALUE self, VALUE str) {
   ruby_curl_easy *rbce;
   int rlen;
   char *result;
-  VALUE rresult;
 
-  TypedData_Get_Struct(self, ruby_curl_easy, &ruby_curl_easy_data_type, rbce);
+  rbce = ruby_curl_easy_get_handle(self);
+
+  /* Coerce as its own statement before use below - StringValuePtr and
+   * RSTRING_LEN are sibling args to the same call and C does not guarantee
+   * left-to-right evaluation order between them. */
+  StringValue(str);
 
 #if (LIBCURL_VERSION_NUM >= 0x070f04)
   result = (char*)curl_easy_unescape(rbce->curl, StringValuePtr(str), (int)RSTRING_LEN(str), &rlen);
 #else
   result = (char*)curl_unescape(StringValuePtr(str), (int)RSTRING_LEN(str));
-  rlen = strlen(result);
 #endif
 
-  rresult = rb_str_new(result, rlen);
-  curl_free(result);
-
-  return rresult;
+  if (!result) rb_raise(eCurlErrError, "Failed to URL-decode string");
+#if (LIBCURL_VERSION_NUM < 0x070f04)
+  rlen = (int)strlen(result);
+#endif
+  return curl_string_result_to_ruby(result, rlen);
 }
 
 
@@ -4664,8 +6316,10 @@ static VALUE rb_easy_set_share(VALUE self, VALUE share) {
 void init_curb_easy() {
   idCall = rb_intern("call");
   idJoin = rb_intern("join");
+  idNetworkPolicyNone = rb_intern("none");
+  idNetworkPolicyPublic = rb_intern("public");
 
-  rbstrAmp = rb_str_new2("&");
+  rbstrAmp = rb_obj_freeze(rb_str_new2("&"));
   rb_global_variable(&rbstrAmp);
 
   cCurlEasy = rb_define_class_under(mCurl, "Easy", rb_cObject);
@@ -4714,6 +6368,17 @@ void init_curb_easy() {
   rb_define_method(cCurlEasy, "ftp_commands", ruby_curl_easy_ftp_commands_get, 0);
   rb_define_method(cCurlEasy, "resolve=", ruby_curl_easy_resolve_set, 1);
   rb_define_method(cCurlEasy, "resolve", ruby_curl_easy_resolve_get, 0);
+  rb_define_method(cCurlEasy, "connect_to=", ruby_curl_easy_connect_to_set, 1);
+  rb_define_method(cCurlEasy, "connect_to", ruby_curl_easy_connect_to_get, 0);
+  rb_define_method(cCurlEasy, "doh_url=", ruby_curl_easy_doh_url_set, 1);
+  rb_define_method(cCurlEasy, "doh_url", ruby_curl_easy_doh_url_get, 0);
+#ifdef HAVE_CURLOPT_DNS_SERVERS
+  rb_define_method(cCurlEasy, "dns_servers", ruby_curl_easy_dns_servers_get, 0);
+#endif
+  rb_define_method(cCurlEasy, "allowed_cidrs=", ruby_curl_easy_allowed_cidrs_set, 1);
+  rb_define_method(cCurlEasy, "allowed_cidrs", ruby_curl_easy_allowed_cidrs_get, 0);
+  rb_define_method(cCurlEasy, "allowed_hosts=", ruby_curl_easy_allowed_hosts_set, 1);
+  rb_define_method(cCurlEasy, "allowed_hosts", ruby_curl_easy_allowed_hosts_get, 0);
 
   rb_define_method(cCurlEasy, "local_port=", ruby_curl_easy_local_port_set, 1);
   rb_define_method(cCurlEasy, "local_port", ruby_curl_easy_local_port_get, 0);
@@ -4725,7 +6390,7 @@ void init_curb_easy() {
   rb_define_method(cCurlEasy, "proxy_type", ruby_curl_easy_proxy_type_get, 0);
   rb_define_method(cCurlEasy, "http_auth_types=", ruby_curl_easy_http_auth_types_set, -1);
   rb_define_method(cCurlEasy, "http_auth_types", ruby_curl_easy_http_auth_types_get, 0);
-  rb_define_method(cCurlEasy, "proxy_auth_types=", ruby_curl_easy_proxy_auth_types_set, 1);
+  rb_define_method(cCurlEasy, "proxy_auth_types=", ruby_curl_easy_proxy_auth_types_set, -1);
   rb_define_method(cCurlEasy, "proxy_auth_types", ruby_curl_easy_proxy_auth_types_get, 0);
   rb_define_method(cCurlEasy, "max_redirects=", ruby_curl_easy_max_redirects_set, 1);
   rb_define_method(cCurlEasy, "max_redirects", ruby_curl_easy_max_redirects_get, 0);
@@ -4741,6 +6406,10 @@ void init_curb_easy() {
   rb_define_method(cCurlEasy, "dns_cache_timeout", ruby_curl_easy_dns_cache_timeout_get, 0);
   rb_define_method(cCurlEasy, "ftp_response_timeout=", ruby_curl_easy_ftp_response_timeout_set, 1);
   rb_define_method(cCurlEasy, "ftp_response_timeout", ruby_curl_easy_ftp_response_timeout_get, 0);
+#ifdef HAVE_CURLOPT_FTP_CREATE_MISSING_DIRS
+  rb_define_method(cCurlEasy, "ftp_create_missing_dirs=", ruby_curl_easy_ftp_create_missing_dirs_set, 1);
+  rb_define_method(cCurlEasy, "ftp_create_missing_dirs", ruby_curl_easy_ftp_create_missing_dirs_get, 0);
+#endif
   rb_define_method(cCurlEasy, "low_speed_limit=", ruby_curl_easy_low_speed_limit_set, 1);
   rb_define_method(cCurlEasy, "low_speed_limit", ruby_curl_easy_low_speed_limit_get, 0);
   rb_define_method(cCurlEasy, "low_speed_time=", ruby_curl_easy_low_speed_time_set, 1);
@@ -4787,6 +6456,8 @@ void init_curb_easy() {
   rb_define_method(cCurlEasy, "ignore_content_length?", ruby_curl_easy_ignore_content_length_q, 0);
   rb_define_method(cCurlEasy, "resolve_mode", ruby_curl_easy_resolve_mode, 0);
   rb_define_method(cCurlEasy, "resolve_mode=", ruby_curl_easy_resolve_mode_set, 1);
+  rb_define_method(cCurlEasy, "network_policy", ruby_curl_easy_network_policy_get, 0);
+  rb_define_method(cCurlEasy, "network_policy=", ruby_curl_easy_network_policy_set, 1);
 
   rb_define_method(cCurlEasy, "on_body", ruby_curl_easy_on_body_set, -1);
   rb_define_method(cCurlEasy, "on_header", ruby_curl_easy_on_header_set, -1);
@@ -4805,6 +6476,8 @@ void init_curb_easy() {
 
   /* Post-perform info methods */
   rb_define_method(cCurlEasy, "body_str", ruby_curl_easy_body_str_get, 0);
+  rb_define_method(cCurlEasy, "max_body_bytes=", ruby_curl_easy_max_body_bytes_set, 1);
+  rb_define_method(cCurlEasy, "max_body_bytes", ruby_curl_easy_max_body_bytes_get, 0);
   rb_define_method(cCurlEasy, "header_str", ruby_curl_easy_header_str_get, 0);
 
   rb_define_method(cCurlEasy, "last_effective_url", ruby_curl_easy_last_effective_url_get, 0);
@@ -4855,9 +6528,16 @@ void init_curb_easy() {
 
   rb_define_method(cCurlEasy, "multi", ruby_curl_easy_multi_get, 0);
   rb_define_method(cCurlEasy, "multi=", ruby_curl_easy_multi_set, 1);
+  rb_define_private_method(cCurlEasy, "__curb_native_setup!", ruby_curl_easy_setup_self, 0);
+  rb_define_private_method(cCurlEasy, "__curb_allow_proxy=", ruby_curl_easy_allow_proxy_set, 1);
+  rb_define_private_method(cCurlEasy, "__curb_allow_unix_socket=", ruby_curl_easy_allow_unix_socket_set, 1);
   rb_define_private_method(cCurlEasy, "_take_callback_error", ruby_curl_easy_take_callback_error, 0);
   rb_define_method(cCurlEasy, "last_result", ruby_curl_easy_last_result, 0);
   rb_define_method(cCurlEasy, "last_error", ruby_curl_easy_last_error, 0);
+  rb_define_method(cCurlEasy, "unsafe_destination_error", ruby_curl_easy_unsafe_destination_error_get, 0);
+#ifdef HAVE_CURLOPT_UNIX_SOCKET_PATH
+  rb_define_method(cCurlEasy, "unix_socket_path", ruby_curl_easy_unix_socket_path_get, 0);
+#endif
 
   rb_define_method(cCurlEasy, "setopt", ruby_curl_easy_set_opt, 2);
   rb_define_method(cCurlEasy, "getinfo", ruby_curl_easy_get_opt, 1);

@@ -70,6 +70,7 @@ class TestCurbCurlNativeCoverage < Test::Unit::TestCase
 
   def test_clone_preserves_native_lists_after_original_handle_closes
     easy = Curl::Easy.new("http://curb.invalid:#{TestServlet.port}#{TestServlet.path}")
+    easy.proxy_url = ""
     easy.headers['X-Test'] = '1'
     easy.proxy_headers['X-Proxy'] = '2'
     easy.ftp_commands = ['PWD']
@@ -88,6 +89,78 @@ class TestCurbCurlNativeCoverage < Test::Unit::TestCase
   ensure
     clone.close if defined?(clone) && clone
     easy.close if defined?(easy) && easy
+  end
+
+  def test_clone_rebinds_upload_callbacks_to_clone_state
+    easy = Curl::Easy.new(TestServlet.url)
+    easy.put_data = 'clone-data'
+
+    clone = easy.clone
+    easy.put_data = 'other-data'
+
+    clone.perform
+
+    assert_equal "PUT\nclone-data", clone.body_str
+  ensure
+    clone.close if defined?(clone) && clone
+    easy.close if defined?(easy) && easy
+  end
+
+  [:clone, :dup].each do |copy_method|
+    [:on_body, :on_header, :on_progress, :on_debug, :on_complete].each do |callback|
+      define_method("test_#{copy_method}_during_multipart_#{callback}_detaches_form") do
+        easy = Curl::Easy.new(TestServlet.url)
+        easy.multipart_form_post = true
+        easy.verbose = true if callback == :on_debug
+        copies = []
+        easy.public_send(callback) do |*args|
+          if copies.empty?
+            # The public option can change while the native form is attached.
+            easy.multipart_form_post = false
+            copies << easy.public_send(copy_method)
+          end
+          [:on_body, :on_header].include?(callback) ? args.first.bytesize : true
+        end
+
+        easy.http_post(Curl::PostField.content('original', 'temporary-form'))
+        assert_equal 1, copies.size, "#{callback} must run during the multipart request"
+        copy = copies.first
+        copy.public_send(callback) # Remove the inherited callback.
+        copy.verbose = false
+
+        # Plain perform must not access or resend the original's freed form.
+        copy.perform
+        easy.public_send(callback)
+        easy.verbose = false
+        easy.perform
+        assert_equal easy.body_str, copy.body_str
+        assert_no_match(/temporary-form|name="original"/, copy.body_str)
+
+        copy.multipart_form_post = true
+        copy.http_post(Curl::PostField.content('replacement', 'fresh-form'))
+        assert_match(/name="replacement"/, copy.body_str)
+        assert_match(/fresh-form/, copy.body_str)
+        assert_no_match(/temporary-form/, copy.body_str)
+      ensure
+        copies&.each(&:close)
+        easy&.close
+      end
+    end
+
+    define_method("test_#{copy_method}_preserves_post_after_multipart_cleanup") do
+      easy = Curl::Easy.new(TestServlet.url)
+      easy.multipart_form_post = true
+      easy.http_post(Curl::PostField.content('original', 'temporary-form'))
+      easy.multipart_form_post = false
+      easy.post_body = 'ordinary=post'
+
+      copy = easy.public_send(copy_method)
+      copy.perform
+      assert_equal "POST\nordinary=post", copy.body_str
+    ensure
+      copy&.close
+      easy&.close
+    end
   end
 
   def test_native_accessors_round_trip

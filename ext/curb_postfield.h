@@ -32,9 +32,18 @@ typedef struct {
 extern VALUE cCurlPostField;
 extern const rb_data_type_t ruby_curl_postfield_data_type;
 
+typedef struct ruby_curl_form_string {
+  struct ruby_curl_form_string *next;
+  long length;
+  char *data;
+} ruby_curl_form_string;
+
+void free_form_strings(ruby_curl_form_string *strings);
+
 void append_to_form(VALUE self, 
                     struct curl_httppost **first, 
-                    struct curl_httppost **last);
+                    struct curl_httppost **last,
+                    ruby_curl_form_string **strings);
 
 void init_curb_postfield();
 

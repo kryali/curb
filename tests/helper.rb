@@ -206,6 +206,13 @@ class TestServlet < WEBrick::HTTPServlet::AbstractServlet
 end
 
 module BugTestServerSetupTeardown
+  def unused_local_port
+    socket = TCPServer.new('127.0.0.1', 0)
+    socket.addr[1]
+  ensure
+    socket.close if socket
+  end
+
   def setup
     @port ||= 9992
     @server = WEBrick::HTTPServer.new(:Port => @port, :Logger => WEBRICK_TEST_LOG, :AccessLog => [])
@@ -221,13 +228,97 @@ module BugTestServerSetupTeardown
     @thread = Thread.new(@server) do|srv|
       srv.start
     end
+
+    # WEBrick#shutdown is a no-op until start has created its shutdown pipe
+    # and set :Running, so wait for that before the test (and its teardown)
+    # runs. Otherwise a teardown racing server startup could miss the brief
+    # :Shutdown status and spin forever once the server settled back on :Stop.
+    sleep 0.001 until @server.status == :Running || !@thread.alive?
+    @thread.value unless @thread.alive?
   end
 
   def teardown
-    while @server.status != :Shutdown
-      @server.shutdown
-    end
+    @server.shutdown
     @thread.join
+  end
+end
+
+# Test::Unit creates a new test instance for every test method. Keep the
+# common WEBrick fixture process-scoped so those instances can share it while
+# still allowing an explicit stop_test_server call to exercise lifecycle code.
+module CurbTestServerRegistry
+  Entry = Struct.new(:key, :port, :server, :thread, :lock_file, :pid)
+
+  @mutex = Mutex.new
+  @entries = {}
+
+  class << self
+    def acquire(port, servlet)
+      key = [port, servlet]
+
+      @mutex.synchronize do
+        entry = @entries[key]
+        return entry if active?(entry)
+
+        @entries.delete(key)
+        entry = yield
+        @entries[key] = entry if entry
+        entry
+      end
+    end
+
+    def stop(entry, timeout)
+      return false unless remove(entry)
+
+      shutdown_entry(entry, timeout)
+      true
+    end
+
+    def register_shutdown_hook(entry)
+      # Test::Unit can run a directly executed test file from its own at_exit
+      # callback. Register after startup so this hook runs after that callback.
+      at_exit { stop(entry, 5) }
+    end
+
+    private
+
+    def active?(entry)
+      entry && entry.server && entry.thread && entry.thread.alive? && entry.server.status == :Running
+    rescue StandardError
+      false
+    end
+
+    def remove(entry)
+      @mutex.synchronize do
+        return false unless @entries[entry.key].equal?(entry)
+
+        @entries.delete(entry.key)
+        true
+      end
+    end
+
+    def shutdown_entry(entry, timeout)
+      return unless Process.pid == entry.pid
+
+      begin
+        entry.server.shutdown if entry.server
+      rescue StandardError
+        nil
+      end
+
+      thread = entry.thread
+      if thread
+        thread.join(timeout)
+        if thread.alive?
+          thread.kill
+          thread.join(timeout)
+        end
+      end
+
+      File.unlink(entry.lock_file) if entry.lock_file && File.exist?(entry.lock_file)
+    rescue Errno::ENOENT
+      nil
+    end
   end
 end
 
@@ -253,6 +344,22 @@ module TestServerMethods
       end
 
       return true if server_responding?(port)
+
+      raise "Failed to startup test server on port #{port}" if Process.clock_gettime(Process::CLOCK_MONOTONIC) >= deadline
+
+      sleep 0.01
+    end
+  end
+
+  # Waiting on WEBrick's state avoids opening a probe connection for every
+  # startup. On Windows those short-lived connections make server teardown
+  # disproportionately expensive.
+  def wait_for_server_started(server, port, thread: nil)
+    deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + server_startup_timeout
+
+    loop do
+      return true if server.status == :Running
+      return false if thread && !thread.alive?
 
       raise "Failed to startup test server on port #{port}" if Process.clock_gettime(Process::CLOCK_MONOTONIC) >= deadline
 
@@ -330,6 +437,13 @@ module TestServerMethods
   end
 
   def stop_test_server
+    shared_entry = instance_variable_defined?(:@__shared_test_server_entry) ? @__shared_test_server_entry : nil
+    if shared_entry
+      CurbTestServerRegistry.stop(shared_entry, server_shutdown_timeout)
+      release_shared_test_server
+      return
+    end
+
     server = instance_variable_defined?(:@server) ? @server : nil
     pid = instance_variable_defined?(:@__pid) ? @__pid : nil
     return unless server || pid
@@ -375,11 +489,28 @@ module TestServerMethods
   def teardown
     super
   ensure
-    stop_test_server
+    if instance_variable_defined?(:@__shared_test_server_entry) && @__shared_test_server_entry
+      release_shared_test_server
+    else
+      stop_test_server
+    end
   end
 
   def server_setup(port=9129,servlet=TestServlet)
     @__port = port
+
+    unless TEST_SINGLE_THREADED
+      entry = CurbTestServerRegistry.acquire(port, servlet) do
+        start_shared_test_server(port, servlet)
+      end
+
+      if entry
+        attach_shared_test_server(entry)
+      end
+
+      return
+    end
+
     @server = nil unless instance_variable_defined?(:@server)
     @__pid = nil unless instance_variable_defined?(:@__pid)
     @test_thread = nil unless instance_variable_defined?(:@test_thread)
@@ -468,6 +599,64 @@ module TestServerMethods
     end
   rescue Errno::EADDRINUSE
   end
+
+  def attach_shared_test_server(entry)
+    @server = entry.server
+    @test_thread = entry.thread
+    @__pid = nil
+    @__shared_test_server_entry = entry
+  end
+
+  def release_shared_test_server
+    @server = nil
+    @test_thread = nil
+    @__pid = nil
+    @__shared_test_server_entry = nil
+  end
+
+  def start_shared_test_server(port, servlet)
+    clear_stale_server_lock(port)
+
+    if File.exist?(locked_file)
+      begin
+        wait_for_server_ready(port)
+        return nil
+      rescue RuntimeError
+        clear_stale_server_lock(port)
+      end
+    end
+
+    write_server_lock
+    server = WEBrick::HTTPServer.new(:Port => port, :DocumentRoot => File.expand_path(File.dirname(__FILE__)), :Logger => WEBRICK_TEST_LOG, :AccessLog => [])
+
+    server.mount(servlet.path, servlet)
+    server.mount("/ext", WEBrick::HTTPServlet::FileHandler, File.join(File.dirname(__FILE__),'..','ext'))
+
+    thread = Thread.new(server) { |srv| srv.start }
+    unless wait_for_server_started(server, port, thread: thread)
+      server.shutdown
+      thread.join(server_shutdown_timeout)
+      raise "Failed to startup test server on port #{port}"
+    end
+
+    entry = CurbTestServerRegistry::Entry.new([port, servlet], port, server, thread, locked_file, Process.pid)
+    CurbTestServerRegistry.register_shutdown_hook(entry)
+    entry
+  rescue Errno::EADDRINUSE
+    File.unlink(locked_file) if File.exist?(locked_file)
+    return nil if server_responding?(port)
+
+    raise
+  rescue StandardError
+    begin
+      server.shutdown if defined?(server) && server
+      thread.join(server_shutdown_timeout) if defined?(thread) && thread
+    rescue StandardError
+      nil
+    end
+    File.unlink(locked_file) if File.exist?(locked_file)
+    raise
+  end
 end
 
 
@@ -546,4 +735,118 @@ end
 
 unless URI.methods.include?(:encode_www_form)
   URI.extend(Backports::Ruby18::URIFormEncoding)
+end
+
+# Valgrind slows every request enough that tight wall-clock bounds stop
+# meaning anything; tests use this to relax or skip only those bounds.
+def curb_under_valgrind?
+  ENV['LD_PRELOAD'].to_s.include?('vgpreload')
+end
+
+# Queue#pop(timeout:) needs Ruby 3.2. Older Rubies take the keyword hash as
+# the positional non_block flag and raise ThreadError immediately.
+def curb_pop_within(queue, seconds)
+  deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + seconds
+  loop do
+    begin
+      return queue.pop(true)
+    rescue ThreadError
+      return nil if Process.clock_gettime(Process::CLOCK_MONOTONIC) >= deadline
+      sleep 0.01
+    end
+  end
+end
+
+# Minimal HTTP/1.1 server so a test controls exactly when and how a response
+# is written. Every request gets its own connection (Connection: close).
+#
+#   /fast                   "fast" immediately
+#   /delay/<seconds>        "delayed" after sleeping
+#   /hang                   "released" once release_hung is called
+#   /stream/<chunks>/<n>    <chunks> writes of <n> bytes (see stream_body)
+#   /truncate               promises 100000 bytes, sends 10, then closes
+#   /reset                  sends part of a body, then aborts with a TCP RST
+class CurbTinyHTTPServer
+  attr_reader :port, :requests
+
+  # Chunk i is filled with one letter so a test can verify reassembly.
+  def self.stream_body(chunks, bytes)
+    (0...chunks).map { |i| (97 + (i % 26)).chr * bytes }.join
+  end
+
+  def initialize
+    @listener = TCPServer.new('127.0.0.1', 0)
+    @port = @listener.addr[1]
+    @requests = Queue.new
+    @release = Queue.new
+    @clients = []
+    @thread = Thread.new { accept_loop }
+  end
+
+  def url(path)
+    "http://127.0.0.1:#{@port}#{path}"
+  end
+
+  # Let pending /hang requests finish.
+  def release_hung(count = 64)
+    count.times { @release << true }
+  end
+
+  def close
+    release_hung
+    @listener.close rescue nil
+    @thread.kill
+    @thread.join(2)
+    @clients.each { |t| t.kill; t.join(1) }
+  end
+
+  private
+
+  def accept_loop
+    loop do
+      sock = @listener.accept
+      @clients << Thread.new(sock) { |s| handle(s) }
+    end
+  rescue IOError, Errno::EBADF
+    nil
+  end
+
+  def handle(sock)
+    request_line = sock.gets.to_s
+    while (line = sock.gets) && line != "\r\n"; end
+    path = request_line.split(' ')[1].to_s
+    @requests << path
+
+    case path
+    when %r{\A/delay/([\d.]+)}
+      sleep Float($1)
+      respond(sock, "delayed")
+    when '/hang'
+      curb_pop_within(@release, 10)
+      respond(sock, "released")
+    when %r{\A/stream/(\d+)/(\d+)}
+      chunks = Integer($1)
+      bytes = Integer($2)
+      sock.write("HTTP/1.1 200 OK\r\nContent-Length: #{chunks * bytes}\r\nConnection: close\r\n\r\n")
+      chunks.times do |i|
+        sock.write((97 + (i % 26)).chr * bytes)
+        Thread.pass
+      end
+    when '/truncate'
+      sock.write("HTTP/1.1 200 OK\r\nContent-Length: 100000\r\nConnection: close\r\n\r\n0123456789")
+    when '/reset'
+      sock.write("HTTP/1.1 200 OK\r\nContent-Length: 100000\r\nConnection: close\r\n\r\n0123456789")
+      sock.setsockopt(Socket::Option.linger(true, 0))
+    else
+      respond(sock, "fast")
+    end
+  rescue IOError, SystemCallError
+    nil
+  ensure
+    sock.close rescue nil
+  end
+
+  def respond(sock, body)
+    sock.write("HTTP/1.1 200 OK\r\nContent-Length: #{body.bytesize}\r\nConnection: close\r\n\r\n#{body}")
+  end
 end

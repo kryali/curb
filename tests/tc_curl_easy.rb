@@ -1,9 +1,131 @@
 require File.expand_path(File.join(File.dirname(__FILE__), 'helper'))
-class FooNoToS 
+class FooNoToS
   undef to_s
 end
 
+class FooBadToS
+  def to_s
+    42
+  end
+end
+
 class TestCurbCurlEasy < Test::Unit::TestCase
+  CONNECTION_INFO_METHODS = %i[
+    last_effective_url response_code code primary_ip http_connect_code file_time
+    total_time name_lookup_time connect_time app_connect_time pre_transfer_time
+    start_transfer_time redirect_time redirect_count redirect_url downloaded_bytes
+    uploaded_bytes download_speed upload_speed header_size request_size
+    ssl_verify_result downloaded_content_length uploaded_content_length content_type
+    os_errno num_connects cookielist ftp_entry_path
+  ].freeze
+
+  def test_uninitialized_handles_reject_native_operations
+    subclass = Class.new(Curl::Easy) { def initialize; end }
+    [Curl::Easy.allocate, subclass.new].each do |easy|
+      methods = CONNECTION_INFO_METHODS + %i[reset close clone dup perform]
+      methods.each do |method|
+        next unless easy.respond_to?(method)
+        error = assert_raise(Curl::Err::FailedInitError, method.to_s) { easy.public_send(method) }
+        assert_match(/not initialized/, error.message)
+      end
+      [[:escape, "x"], [:unescape, "x"], [:setopt, Curl::CURLOPT_VERBOSE, true],
+       [:http_post, "x"], [:http_put, "x"], [:http_patch, "x"]].each do |args|
+        assert_raise(Curl::Err::FailedInitError, args.first.to_s) { easy.public_send(*args) }
+      end
+      multi = Curl::Multi.new
+      begin
+        assert_raise(Curl::Err::FailedInitError) { multi.add(easy) }
+        assert_raise(Curl::Err::FailedInitError) { multi.send(:_remove, easy) }
+      ensure
+        multi.close
+      end
+    end
+  end
+
+  def test_allocated_handle_can_be_initialized
+    easy = Curl::Easy.allocate
+    easy.send(:initialize, $TEST_URL)
+    easy.perform
+    # libcurl normalizes file:///C:/ to file://C:/ on Windows.
+    expected_url = WINDOWS ? $TEST_URL.sub(%r{\Afile:///}, "file://") : $TEST_URL
+    assert_equal expected_url, easy.last_effective_url
+    assert_match(/^# DO NOT REMOVE THIS COMMENT/, easy.body_str)
+  end
+
+  def test_connection_info_before_perform
+    easy = Curl::Easy.new
+    CONNECTION_INFO_METHODS.each do |method|
+      next unless easy.respond_to?(method)
+      assert_nothing_raised(method.to_s) { easy.public_send(method) }
+    end
+    assert_nil easy.last_effective_url
+    assert_nil easy.content_type
+    assert_equal 0, easy.response_code
+  end
+
+  def test_reinitialize_detaches_previous_handle
+    easy = Curl::Easy.new($TEST_URL)
+    easy.headers = { "X-Old" => "old" }
+    multi = Curl::Multi.new
+    multi.add(easy)
+    easy.send(:initialize, $TEST_URL)
+    assert_nil easy.multi
+    assert_equal({}, easy.headers)
+    multi.perform
+    easy.perform
+    assert_match(/^# DO NOT REMOVE THIS COMMENT/, easy.body_str)
+    multi.add(easy)
+    multi.perform
+    assert_match(/^# DO NOT REMOVE THIS COMMENT/, easy.body_str)
+  ensure
+    multi.close if multi
+  end
+
+  [:initialize, :close, :reset].each do |operation|
+    define_method("test_#{operation}_removes_multi_bookkeeping_before_readd") do
+      easy = Curl::Easy.new($TEST_URL)
+      multi = Curl::Multi.new
+      multi.add(easy)
+      easy.__send__(operation)
+
+      assert_nil easy.multi
+      assert_empty multi.requests
+      assert_empty multi.__send__(:__curb_native_safety_signatures)
+
+      easy.url = $TEST_URL
+      multi.add(easy)
+      assert_equal [easy], multi.requests.values
+      multi.perform
+      assert_match(/^# DO NOT REMOVE THIS COMMENT/, easy.body_str)
+    ensure
+      multi.close if multi
+      easy.close if easy
+    end
+  end
+
+  def test_reinitialize_during_callback_is_blocked
+    easy = Curl::Easy.new($TEST_URL)
+    easy.on_body do |data|
+      error = assert_raise(RuntimeError) { easy.send(:initialize, $TEST_URL) }
+      assert_match(/Cannot initialize an active curl handle/, error.message)
+      data.bytesize
+    end
+    easy.perform
+    easy.send(:initialize, $TEST_URL)
+    easy.perform
+    assert_match(/^# DO NOT REMOVE THIS COMMENT/, easy.body_str)
+  end
+
+  def test_reinitialize_during_argument_coercion_is_blocked
+    easy = Curl::Easy.new($TEST_URL)
+    field = Object.new
+    field.define_singleton_method(:to_s) { easy.send(:initialize, $TEST_URL); "a=b" }
+    error = assert_raise(RuntimeError) { easy.http_post(field) }
+    assert_match(/Cannot initialize an active curl handle/, error.message)
+    easy.perform
+    assert_match(/^# DO NOT REMOVE THIS COMMENT/, easy.body_str)
+  end
+
   def test_global_reset
     Curl.get($TEST_URL)
     # in a Timeout block you should reset the thread current handle 
@@ -16,6 +138,13 @@ class TestCurbCurlEasy < Test::Unit::TestCase
       assert_equal 404, res.code
     }
     assert_equal 200, easy.code
+  end
+
+  def test_perform_with_implicit_multi
+    easy = Curl::Easy.new($TEST_URL)
+
+    assert_nothing_raised { easy.perform }
+    assert_match(/^# DO NOT REMOVE THIS COMMENT/, easy.body_str)
   end
 
   def test_curlopt_resolve
@@ -39,6 +168,7 @@ class TestCurbCurlEasy < Test::Unit::TestCase
 
     http = Curl::Easy.new(url)
     http.dns_cache_timeout = 0
+    http.proxy_url = ""
     http.resolve = [mapping]
     http.get
     assert_match(/GET/, http.body)
@@ -121,6 +251,50 @@ class TestCurbCurlEasy < Test::Unit::TestCase
     assert_match(/HTTP\/1\.1\s\d+\s/, easy.header_str.to_s)
     # Body should be empty for HEAD requests (libcurl won't call the write callback).
     assert_equal "", easy.body_str.to_s
+  end
+
+  def test_head_request_restores_easy_state_after_callback_exception
+    easy = Curl::Easy.new(TestServlet.url)
+    easy.on_complete { raise "head complete blew up" }
+
+    error = assert_raise(Curl::Err::AbortedByCallbackError) { easy.http("HEAD") }
+    assert_equal "head complete blew up", error.message
+
+    easy.on_complete { |_curl| }
+    easy.perform
+
+    assert_equal "GET", easy.body_str
+  end
+
+  def test_patch_request_does_not_leak_custom_method_to_next_perform
+    easy = Curl::Easy.new(TestServlet.url)
+
+    easy.http_patch("a=b")
+    assert_equal "PATCH\na=b", easy.body_str
+
+    easy.perform
+    assert_equal "GET", easy.body_str
+  end
+
+  def test_put_request_does_not_leak_custom_method_to_next_perform
+    easy = Curl::Easy.new(TestServlet.url)
+
+    easy.http_put("payload")
+    assert_equal "PUT\npayload", easy.body_str
+
+    easy.perform
+    assert_equal "GET", easy.body_str
+  end
+
+  def test_failed_put_data_setup_does_not_leave_easy_in_upload_mode
+    easy = Curl::Easy.new(TestServlet.url)
+    easy.headers = ["X-Test: true"]
+
+    assert_raise(RuntimeError) { easy.put_data = "payload" }
+
+    easy.headers = {}
+    easy.perform
+    assert_equal "GET", easy.body_str
   end
 
   def test_perform_releases_failed_implicit_multi_without_follow_up_easy_perform
@@ -508,7 +682,24 @@ class TestCurbCurlEasy < Test::Unit::TestCase
       assert_equal "one\000two three", c.unescape("one%00two%20three")
     end
   end
-  
+
+  def test_escape_with_non_string_to_s_result_does_not_crash
+    c = Curl::Easy.new
+    result = nil
+    # #to_s returning a non-String (42, a Fixnum) makes rb_obj_as_string
+    # fall back to the default Object#to_s representation rather than "42" -
+    # the point of this test is that it doesn't crash, not the exact value.
+    assert_nothing_raised { result = c.escape(FooBadToS.new) }
+    assert_kind_of String, result
+  end
+
+  def test_unescape_with_non_string_to_s_result_raises_type_error
+    c = Curl::Easy.new
+    # unescape expects an actual String (or something #to_str-coercible);
+    # it must raise cleanly rather than crash on a bad #to_s.
+    assert_raise(TypeError) { c.unescape(FooBadToS.new) }
+  end
+
   def test_headers
     c = Curl::Easy.new($TEST_URL)
     
@@ -693,7 +884,23 @@ class TestCurbCurlEasy < Test::Unit::TestCase
     c.http_auth_types = nil
     assert_nil c.http_auth_types
   end
-  
+
+  def test_http_auth_types_with_non_string_to_s_result_does_not_crash
+    c = Curl::Easy.new
+    assert_nothing_raised { c.http_auth_types = FooBadToS.new }
+    assert_nothing_raised { c.http_auth_types = [FooBadToS.new, :basic] }
+    assert_equal Curl::CURLAUTH_BASIC, c.http_auth_types
+  end
+
+  def test_http_auth_types_array_of_symbols
+    c = Curl::Easy.new
+    c.http_auth_types = [:basic, :digest]
+    assert_equal Curl::CURLAUTH_BASIC | Curl::CURLAUTH_DIGEST, c.http_auth_types
+
+    c.send(:http_auth_types=, :basic, :ntlm)
+    assert_equal Curl::CURLAUTH_BASIC | Curl::CURLAUTH_NTLM, c.http_auth_types
+  end
+
   def test_proxy_auth_types_01
     c = Curl::Easy.new($TEST_URL)
     
@@ -705,7 +912,23 @@ class TestCurbCurlEasy < Test::Unit::TestCase
     c.proxy_auth_types = nil
     assert_nil c.proxy_auth_types
   end
-  
+
+  def test_proxy_auth_types_symbols
+    c = Curl::Easy.new
+
+    c.proxy_auth_types = :basic
+    assert_equal Curl::CURLAUTH_BASIC, c.proxy_auth_types
+
+    c.proxy_auth_types = [:basic, :ntlm]
+    assert_equal Curl::CURLAUTH_BASIC | Curl::CURLAUTH_NTLM, c.proxy_auth_types
+
+    c.send(:proxy_auth_types=, :basic, :digest)
+    assert_equal Curl::CURLAUTH_BASIC | Curl::CURLAUTH_DIGEST, c.proxy_auth_types
+
+    assert_nothing_raised { c.proxy_auth_types = [FooBadToS.new, :basic] }
+    assert_equal Curl::CURLAUTH_BASIC, c.proxy_auth_types
+  end
+
   def test_max_redirects_01
     c = Curl::Easy.new($TEST_URL)
     
@@ -1301,6 +1524,24 @@ class TestCurbCurlEasy < Test::Unit::TestCase
     assert_equal "POST\nfoo=bar", curl.body_str
   end
 
+  def test_multipart_patch_build_failure_restores_easy_request_state
+    curl = Curl::Easy.new(TestServlet.url)
+    curl.multipart_form_post = true
+    field = Curl::PostField.content('document_id', '5')
+
+    field.name = nil
+    error = assert_raise(Curl::Err::InvalidPostFieldError) do
+      # The first field allocates native multipart form state before the second field raises.
+      curl.http_patch(Curl::PostField.content('keep', 'allocated'), field)
+    end
+    assert_match(/Cannot post unnamed field/, error.message)
+
+    curl.multipart_form_post = false
+    curl.perform
+
+    assert_equal 'GET', curl.body_str
+  end
+
   def test_delete_remote
     curl = Curl::Easy.new(TestServlet.url)
     curl.http_delete
@@ -1356,6 +1597,44 @@ class TestCurbCurlEasy < Test::Unit::TestCase
     
     assert_match(/^PUT/, curl.body_str)
     assert_match(/message$/, curl.body_str)
+  end
+
+  def test_put_data_from_to_s_object
+    curl = Curl::Easy.new(TestServlet.url)
+    curl.put_data = :message
+
+    curl.perform
+
+    assert_equal "PUT\nmessage", curl.body_str
+  end
+
+  def test_put_data_read_exception_sets_result_and_releases_callback_state
+    error_class = Class.new(StandardError)
+    reader_class = Class.new do
+      define_method(:read) do |_len|
+        raise error_class, 'upload read failed'
+      end
+
+      def seek(_offset, _whence = SEEK_SET)
+        0
+      end
+
+      def stat
+        Struct.new(:size).new(1)
+      end
+    end
+
+    curl = Curl::Easy.new(TestServlet.url)
+    curl.put_data = reader_class.new
+
+    error = assert_raise(error_class) { curl.perform }
+    assert_equal 'upload read failed', error.message
+    assert_not_equal 0, curl.last_result
+
+    curl.url = TestServlet.url
+    curl.http_get
+
+    assert_equal 'GET', curl.body_str
   end
 
   # https://github.com/taf2/curb/issues/101
@@ -1460,6 +1739,10 @@ class TestCurbCurlEasy < Test::Unit::TestCase
       # header value and encoding; skip the NTLM-specific assertion.
       return
     end
+    # curl 8.20.0 disables NTLM by default and plans to remove it in
+    # September 2026; libcurl silently downgrades to Basic when NTLM is
+    # unavailable, so skip the NTLM-specific assertion in that case.
+    return unless Curl.ntlm?
     curl = Curl::Easy.new(TestServlet.url)
     curl.username = "foo"
     curl.password = "bar"
@@ -1501,6 +1784,18 @@ class TestCurbCurlEasy < Test::Unit::TestCase
     easy.http_get
   end
 
+  def test_easy_close_restores_error_buffer
+    easy = Curl::Easy.new('http://127.0.0.1:1')
+    assert_raise(Curl::Err::ConnectionFailedError) { easy.perform }
+    assert_not_nil easy.last_error
+
+    easy.close
+    easy.url = 'http://127.0.0.1:1'
+    assert_raise(Curl::Err::ConnectionFailedError) { easy.perform }
+
+    assert_not_nil easy.last_error
+  end
+
   def test_easy_reset
     easy = Curl::Easy.new
     easy.url = TestServlet.url + "?query=foo"
@@ -1511,6 +1806,36 @@ class TestCurbCurlEasy < Test::Unit::TestCase
     assert settings.key?(:header_data)
     easy.url = TestServlet.url
     easy.http_get
+  end
+
+  def test_easy_reset_clears_network_policy_allowlists
+    easy = Curl::Easy.new(TestServlet.url)
+    easy.allowed_hosts = ['127.0.0.1']
+    easy.network_policy = :public
+    easy.allowed_cidrs = ['1.1.1.0/24']
+
+    settings = easy.reset
+
+    assert settings.key?(:allowed_hosts)
+    assert settings.key?(:allowed_cidrs)
+    assert_nil easy.allowed_hosts
+    assert_nil easy.allowed_cidrs
+    assert_equal :none, easy.network_policy
+  rescue NotImplementedError
+    omit('network_policy=:public requires CURLOPT_OPENSOCKETFUNCTION support')
+  end
+
+  def test_frozen_easy_close_and_reset_skip_safety_override_cleanup
+    closed_easy = Curl::Easy.new
+    closed_easy.freeze
+
+    assert_nothing_raised { closed_easy.close }
+
+    reset_easy = Curl::Easy.new
+    reset_easy.safe_http!
+    reset_easy.freeze
+
+    assert_nothing_raised { reset_easy.reset }
   end
 
   def test_last_result_initialization
@@ -1664,6 +1989,35 @@ class TestCurbCurlEasy < Test::Unit::TestCase
     end
   end
 
+  def test_close_during_http_post_argument_coercion_is_blocked
+    curl = Curl::Easy.new(TestServlet.url)
+    field = Object.new
+    field.define_singleton_method(:to_s) do
+      curl.close
+      "a=b"
+    end
+
+    error = assert_raise(RuntimeError) { curl.http_post(field) }
+    assert_match(/Cannot close an active curl handle/, error.message)
+
+    assert_nothing_raised { curl.close }
+  end
+
+  def test_close_during_url_coercion_is_blocked
+    curl = Curl::Easy.new
+    url = Object.new
+    url.define_singleton_method(:to_str) do
+      curl.close
+      TestServlet.url
+    end
+
+    curl.url = url
+    error = assert_raise(RuntimeError) { curl.perform }
+    assert_match(/Cannot close an active curl handle/, error.message)
+
+    assert_nothing_raised { curl.close }
+  end
+
   def test_close_in_on_progress_is_blocked
     curl = Curl::Easy.new(TestServlet.url)
     did_raise = false
@@ -1747,6 +2101,16 @@ class TestCurbCurlEasy < Test::Unit::TestCase
     assert_raises TypeError do
       curl.set(99999, 1)
     end
+  end
+
+  def test_poison
+    res_a = Curl.get("#{TestServlet.url}?a_body")
+    first_a_body = Digest::MD5.hexdigest(res_a.body)
+    res_b = Curl.get("#{TestServlet.url}?b_body")
+
+    b_body = Digest::MD5.hexdigest(res_b.body)
+    a_body = Digest::MD5.hexdigest(res_a.body)
+    assert_not_equal a_body, b_body, "we expected #{a_body} to be #{first_a_body}"
   end
 
   include TestServerMethods 

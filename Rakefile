@@ -106,9 +106,38 @@ else
   task :alltests => [:unittests, :bugtests]
 end
 
-RubyMemcheck.config(binary_name: 'curb_core')
+ruby_memcheck_config = { binary_name: 'curb_core' }
+ruby_version = Gem::Version.new(RUBY_VERSION)
+
+if RUBY_ENGINE == 'ruby' && ruby_version >= Gem::Version.new('4.0.4') && ruby_version < Gem::Version.new('4.1.0')
+  # Ruby 4.0.4+ reports fiber/block-handler VM stack accesses under Valgrind.
+  # Keep reporting errors that originate in curb_core, but filter Ruby-side noise.
+  ruby_memcheck_config[:filter_all_errors] = true
+  if RubyMemcheck::Configuration.instance_method(:initialize).parameters.any? { |type, name|
+       type == :key && name == :use_only_ruby_free_at_exit
+     }
+    ruby_memcheck_config[:use_only_ruby_free_at_exit] = false
+  end
+  ruby_memcheck_config[:skipped_ruby_functions] =
+    RubyMemcheck::Configuration::DEFAULT_SKIPPED_RUBY_FUNCTIONS + [
+      /\Arb_vm_frame_block_handler\z/
+    ]
+end
+
+RubyMemcheck.config(**ruby_memcheck_config)
 namespace :test do
-  RubyMemcheck::TestTask.new(valgrind: :compile) do|t|
+  # Ruby pools fiber stacks next to each other, about 1MB apart. Valgrind
+  # treats a stack-pointer jump smaller than --max-stackframe (2MB) as an
+  # ordinary call or return rather than a switch to another stack, and marks
+  # the memory in between, which can hold another fiber's stack, as
+  # inaccessible. Later reads of that fiber's stack (turning a block into a
+  # Proc, GC marking suspended fibers) are then reported as invalid. Spacing
+  # fiber stacks wider than that lets valgrind recognize every fiber switch.
+  task :valgrind_env do
+    ENV['RUBY_FIBER_MACHINE_STACK_SIZE'] ||= (4 * 1024 * 1024).to_s
+  end
+
+  RubyMemcheck::TestTask.new(valgrind: [:compile, :valgrind_env]) do|t|
     t.test_files = FileList['tests/tc_*.rb']
     t.verbose = false
   end
@@ -166,7 +195,11 @@ end
 # RDoc Tasks ---------------------------------------------------------
 desc "Create the RDOC documentation"
 task :doc do
-  ruby "doc.rb #{ENV['DOC_OPTS']}"
+  doc_opts = Shellwords.split(ENV.fetch('DOC_OPTS', ''))
+  unsupported_opts = doc_opts - ['--cpp']
+  fail "Unsupported DOC_OPTS: #{unsupported_opts.join(' ')}" unless unsupported_opts.empty?
+
+  ruby 'doc.rb', *doc_opts
 end
 
 desc "Publish the RDoc documentation to project web site"

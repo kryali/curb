@@ -243,25 +243,38 @@ static void finalize_curb_core(VALUE data) {
 
 void Init_curb_core() {
   curl_version_info_data *ver;
-  VALUE curlver, curllongver, curlvernum;
+  VALUE curbver, curlver, curllongver, curlvernum;
+  int ractor_safe = 0;
 
   curl_global_init(CURL_GLOBAL_ALL);
   rb_set_end_proc(finalize_curb_core, Qnil);
   ver = curl_version_info(CURLVERSION_NOW);
 
+#if defined(HAVE_RB_EXT_RACTOR_SAFE) && defined(HAVE_CURL_VERSION_THREADSAFE)
+  /* Ractors execute native methods in parallel. Only opt in when both Ruby
+   * provides the safety marker and libcurl advertises thread-safe global
+   * initialization. Individual Curl handles remain Ractor-owned. */
+  if (ver && (ver->features & CURL_VERSION_THREADSAFE)) {
+    rb_ext_ractor_safe(1);
+    ractor_safe = 1;
+  }
+#endif
+
   mCurl = rb_define_module("Curl");
 
-  curlver = rb_str_new2(ver->version);
-  curllongver = rb_str_new2(curl_version());
+  curbver = rb_obj_freeze(rb_str_new2(CURB_VERSION));
+  curlver = rb_obj_freeze(rb_str_new2(ver->version));
+  curllongver = rb_obj_freeze(rb_str_new2(curl_version()));
   curlvernum = LONG2NUM(LIBCURL_VERSION_NUM);
 
-  rb_define_const(mCurl, "CURB_VERSION", rb_str_new2(CURB_VERSION));
+  rb_define_const(mCurl, "CURB_VERSION", curbver);
   rb_define_const(mCurl, "VERSION", curlver);
   rb_define_const(mCurl, "CURL_VERSION", curlver);
   rb_define_const(mCurl, "VERNUM", curlvernum);
   rb_define_const(mCurl, "CURL_VERNUM", curlvernum);
   rb_define_const(mCurl, "LONG_VERSION", curllongver);
   rb_define_const(mCurl, "CURL_LONG_VERSION", curllongver);
+  rb_define_const(mCurl, "RACTOR_SAFE", ractor_safe ? Qtrue : Qfalse);
 
   /* Passed to on_debug handler to indicate that the data is informational text. */
   rb_define_const(mCurl, "CURLINFO_TEXT", LONG2NUM(CURLINFO_TEXT));
@@ -458,6 +471,12 @@ void Init_curb_core() {
 #ifdef HAVE_CURLOPT_OPENSOCKETDATA
   CURB_DEFINE(CURLOPT_OPENSOCKETDATA);
 #endif
+#ifdef HAVE_CURLOPT_PREREQFUNCTION
+  CURB_DEFINE(CURLOPT_PREREQFUNCTION);
+#endif
+#ifdef HAVE_CURLOPT_PREREQDATA
+  CURB_DEFINE(CURLOPT_PREREQDATA);
+#endif
   /* CURLOPT_PROGRESSFUNCTION deprecated since 7.32.0, use XFERINFOFUNCTION */
 #ifdef HAVE_CURLOPT_PROGRESSFUNCTION
   CURB_DEFINE(CURLOPT_PROGRESSFUNCTION);
@@ -557,6 +576,9 @@ void Init_curb_core() {
   CURB_DEFINE(CURLOPT_LOCALPORT);
 #endif
   CURB_DEFINE(CURLOPT_DNS_CACHE_TIMEOUT);
+#ifdef HAVE_CURLOPT_DNS_SERVERS
+  CURB_DEFINE(CURLOPT_DNS_SERVERS);
+#endif
   /* CURLOPT_DNS_USE_GLOBAL_CACHE deprecated since 7.11.1, does nothing since 7.62.0 */
 #ifdef HAVE_CURLOPT_DNS_USE_GLOBAL_CACHE
   CURB_DEFINE(CURLOPT_DNS_USE_GLOBAL_CACHE);
@@ -738,6 +760,15 @@ void Init_curb_core() {
 #endif
 #ifdef HAVE_CURLOPT_FTP_CREATE_MISSING_DIRS
   CURB_DEFINE(CURLOPT_FTP_CREATE_MISSING_DIRS);
+#endif
+#ifdef HAVE_CURLFTP_CREATE_DIR_NONE
+  CURB_DEFINE(CURLFTP_CREATE_DIR_NONE);
+#endif
+#ifdef HAVE_CURLFTP_CREATE_DIR
+  CURB_DEFINE(CURLFTP_CREATE_DIR);
+#endif
+#ifdef HAVE_CURLFTP_CREATE_DIR_RETRY
+  CURB_DEFINE(CURLFTP_CREATE_DIR_RETRY);
 #endif
 #ifdef HAVE_CURLOPT_FTP_RESPONSE_TIMEOUT
   CURB_DEFINE(CURLOPT_FTP_RESPONSE_TIMEOUT);
@@ -955,6 +986,9 @@ void Init_curb_core() {
 #ifdef HAVE_CURLUSESSL_ALL
   CURB_DEFINE(CURLUSESSL_ALL);
 #endif
+#ifdef HAVE_CURLOPT_CONNECT_TO
+  CURB_DEFINE(CURLOPT_CONNECT_TO);
+#endif
 #ifdef HAVE_CURLOPT_RESOLVE
   CURB_DEFINE(CURLOPT_RESOLVE);
 #endif
@@ -1010,6 +1044,18 @@ void Init_curb_core() {
 #endif
 #ifdef HAVE_CURLOPT_SSL_VERIFYPEER
   CURB_DEFINE(CURLOPT_SSL_VERIFYPEER);
+#endif
+#ifdef HAVE_CURLOPT_DOH_URL
+  CURB_DEFINE(CURLOPT_DOH_URL);
+#endif
+#ifdef HAVE_CURLOPT_DOH_SSL_VERIFYPEER
+  CURB_DEFINE(CURLOPT_DOH_SSL_VERIFYPEER);
+#endif
+#ifdef HAVE_CURLOPT_DOH_SSL_VERIFYHOST
+  CURB_DEFINE(CURLOPT_DOH_SSL_VERIFYHOST);
+#endif
+#ifdef HAVE_CURLOPT_DOH_SSL_VERIFYSTATUS
+  CURB_DEFINE(CURLOPT_DOH_SSL_VERIFYSTATUS);
 #endif
 #ifdef HAVE_CURLOPT_CAINFO
   CURB_DEFINE(CURLOPT_CAINFO);

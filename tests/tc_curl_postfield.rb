@@ -136,10 +136,25 @@ class TestCurbCurlPostfield < Test::Unit::TestCase
     assert_equal "foo=FOOBAR", pf.to_s
   end
 
+  def test_content_proc_survives_gc
+    pf = postfield_with_only_native_proc_reference
+
+    10.times do
+      GC.start(full_mark: true, immediate_sweep: true)
+      GC.compact if GC.respond_to?(:compact)
+    end
+
+    assert_equal "foo=FOOBAR", pf.to_s
+  end
+
   def test_to_s_04
     pf = Curl::PostField.file('foo.file', 'bar.file')
     assert_nothing_raised { pf.to_s }
     #assert_raise(Curl::Err::InvalidPostFieldError) { pf.to_s }
+  end
+
+  def postfield_with_only_native_proc_reference
+    Curl::PostField.content('foo') { |field| field.name.upcase + "BAR" }
   end
 end
 
@@ -238,6 +253,143 @@ class TestCurbCurlPostfieldMultipartCoverage < Test::Unit::TestCase
     server_setup
   end
 
+  [:http_post, :http_patch, :http_put].each do |method|
+    [:close, :reset, :initialize, :perform, :http_post, :post_body=].each do |operation|
+      [:proc, :coercion].each do |source|
+        define_method("test_#{method}_guards_#{operation}_from_#{source}") do
+          curl = Curl::Easy.new(TestServlet.url)
+          curl.multipart_form_post = true
+          action = lambda do |*_|
+            if operation == :post_body=
+              curl.post_body = 'replacement'
+            elsif operation == :http_post
+              curl.http_post(Curl::PostField.content('nested', 'payload'))
+            else
+              curl.__send__(operation)
+            end
+            'payload'
+          end
+          field = if source == :proc
+            Curl::PostField.content('trigger', &action)
+          else
+            value = Object.new
+            value.define_singleton_method(:to_str, &action)
+            Curl::PostField.content('trigger', value)
+          end
+
+          error = assert_raise(RuntimeError) do
+            curl.__send__(method, Curl::PostField.content('first', 'allocated'), field)
+          end
+          assert_match(/active curl handle/, error.message)
+
+          # Both partial forms and guards must unwind before reuse.
+          curl.multipart_form_post = false
+          curl.perform
+          assert_equal 'GET', curl.body_str
+          assert_nothing_raised { curl.reset }
+          assert_nothing_raised { curl.close }
+        end
+      end
+    end
+  end
+
+  [:content, :file].each do |kind|
+    [false, true].each do |dynamic|
+      define_method("test_multipart_snapshots_#{kind}_#{dynamic ? 'proc' : 'direct'}") do
+        name = +'original_name'
+        payload = +"original\0payload"
+        field = multipart_field(kind, dynamic, nil, payload)
+        field.name = name
+        later = Curl::PostField.content('later') do
+          Thread.new do
+            name.replace('changed_name' * 1000)
+            payload.replace('changed_payload' * 1000)
+            field.content = nil
+            field.name = nil
+            GC.start
+            GC.verify_compaction_references(double_heap: true, toward: :empty) if GC.respond_to?(:verify_compaction_references)
+          end.join
+          'later_value'
+        end
+        curl = Curl::Easy.new(TestServlet.url)
+        curl.multipart_form_post = true
+        curl.http_post(field, later)
+
+        assert_include curl.body_str, 'name="original_name"'
+        assert_include curl.body_str, "original\0payload"
+        assert_include curl.body_str, 'filename="remote.txt"' if kind == :file
+        assert_not_include curl.body_str, 'changed_payload'
+      end
+    end
+  end
+
+  def test_multipart_snapshots_before_later_coercions_in_same_field
+    name = +'original_name'
+    payload = +'original_payload'
+    content_type = Object.new
+    content_type.define_singleton_method(:to_str) do
+      name.replace('changed_name' * 1000)
+      payload.replace('changed_payload' * 1000)
+      'text/plain'
+    end
+    field = Curl::PostField.content(name, payload, content_type)
+    curl = Curl::Easy.new(TestServlet.url)
+    curl.multipart_form_post = true
+    curl.http_post(field)
+
+    assert_include curl.body_str, 'name="original_name"'
+    assert_include curl.body_str, 'original_payload'
+  end
+
+  # Exercise each pointer/length pair with and without a content type.
+  [:content, :file].each do |kind|
+    [false, true].each do |dynamic|
+      [nil, 'text/plain'].each do |content_type|
+        variant = "#{kind}_#{dynamic ? 'proc' : 'direct'}_#{content_type ? 'typed' : 'untyped'}"
+
+        define_method("test_multipart_coerces_#{variant}") do
+          payload = "before\0after"
+          string_like = Object.new
+          string_like.define_singleton_method(:to_str) { payload }
+          field = multipart_field(kind, dynamic, content_type, string_like)
+          curl = Curl::Easy.new(TestServlet.url)
+          curl.multipart_form_post = true
+
+          curl.http_post(field)
+
+          assert_include curl.body_str, payload
+          assert_equal payload, field.content unless dynamic
+        end
+
+        define_method("test_multipart_rejects_non_string_#{variant}") do
+          field = multipart_field(kind, dynamic, content_type, 5)
+          curl = Curl::Easy.new(TestServlet.url)
+          curl.multipart_form_post = true
+
+          assert_raise(TypeError) { curl.http_post(field) }
+        end
+      end
+    end
+  end
+
+  def multipart_field(kind, dynamic, content_type, value)
+    field = if dynamic
+      if kind == :file
+        Curl::PostField.file('upload', 'remote.txt') { value }
+      else
+        Curl::PostField.content('value') { value }
+      end
+    elsif kind == :file
+      upload = Curl::PostField.file('upload', 'remote.txt')
+      upload.content = value
+      upload
+    else
+      Curl::PostField.content('value', value)
+    end
+    field.content_type = content_type
+    field
+  end
+
   def test_multipart_content_variants_include_dynamic_and_typed_fields
     curl = Curl::Easy.new(TestServlet.url)
     curl.multipart_form_post = true
@@ -301,5 +453,44 @@ class TestCurbCurlPostfieldMultipartCoverage < Test::Unit::TestCase
     assert_match(/name="local_with_type"/, body)
     assert_match(/Curb - Libcurl bindings for Ruby/, body)
     assert_match(/Content-Type: text\/plain/, body)
+  end
+end
+
+class TestCurbCurlPostfieldInvalidToS < Test::Unit::TestCase
+  class BadToS
+    def to_s
+      42
+    end
+  end
+
+  def test_to_s_with_non_string_content_to_s_result_does_not_crash
+    pf = Curl::PostField.content('name', BadToS.new)
+    body = nil
+    assert_nothing_raised { body = pf.to_s }
+    assert_kind_of String, body
+    assert body.start_with?('name=')
+  end
+
+  def test_to_s_with_non_string_name_to_s_result_does_not_crash
+    pf = Curl::PostField.content(BadToS.new, 'value')
+    body = nil
+    assert_nothing_raised { body = pf.to_s }
+    assert_kind_of String, body
+  end
+
+  def test_to_s_with_content_proc_returning_non_string_does_not_crash
+    pf = Curl::PostField.content('name') { BadToS.new }
+    assert_nothing_raised { pf.to_s }
+  end
+
+  def test_to_s_content_proc_raising_error_still_propagates
+    pf = Curl::PostField.content('name') { raise 'boom' }
+    error = assert_raise(RuntimeError) { pf.to_s }
+    assert_equal 'boom', error.message
+  end
+
+  def test_to_s_still_coerces_objects_with_valid_to_s
+    pf = Curl::PostField.content('name', 42)
+    assert_equal 'name=42', pf.to_s
   end
 end

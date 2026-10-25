@@ -20,12 +20,17 @@
 #define rb_easy_get_str(key) \
   RSTRING_PTR((rb_easy_type_check(key,T_STRING) ? rb_easy_get(key) : rb_str_to_str(rb_easy_get(key))))
 
+/* Easy attribute macros also participate in the native access guard. */
+#define CURB_CHECK_ACCESS_ruby_curl_easy(ptr) ruby_curl_easy_check_access(ptr)
+#define CURB_CHECK_ACCESS_ruby_curl_postfield(ptr) ((void)0)
+
 /* getter/setter macros for various things */
 /* setter for anything that stores a ruby VALUE in the struct */
 #define CURB_OBJECT_SETTER(type, attr)                              \
             type *ptr;                                              \
                                                                     \
             TypedData_Get_Struct(self, type, &type##_data_type, ptr); \
+            CURB_CHECK_ACCESS_##type(ptr);                          \
             ptr->attr = attr;                                       \
                                                                     \
             return attr;
@@ -35,6 +40,7 @@
             type *ptr;                                              \
                                                                     \
             TypedData_Get_Struct(self, type, &type##_data_type, ptr); \
+            CURB_CHECK_ACCESS_##type(ptr);                          \
             return ptr->attr;
 
 /* setter for anything that stores a ruby VALUE in the struct opts hash */
@@ -42,6 +48,7 @@
             type *ptr;                                              \
                                                                     \
             TypedData_Get_Struct(self, type, &type##_data_type, ptr); \
+            CURB_CHECK_ACCESS_##type(ptr);                          \
             rb_hash_aset(ptr->opts, rb_easy_hkey(#attr), attr);       \
                                                                     \
             return attr;
@@ -51,12 +58,14 @@
             type *ptr;                                              \
                                                                     \
             TypedData_Get_Struct(self, type, &type##_data_type, ptr); \
+            CURB_CHECK_ACCESS_##type(ptr);                          \
             return rb_hash_aref(ptr->opts, rb_easy_hkey(#attr));
 
 /* setter for bool flags */
 #define CURB_BOOLEAN_SETTER(type, attr)                             \
             type *ptr;                                              \
             TypedData_Get_Struct(self, type, &type##_data_type, ptr); \
+            CURB_CHECK_ACCESS_##type(ptr);                          \
                                                                     \
             if (attr == Qnil || attr == Qfalse) {                   \
               ptr->attr = 0;                                        \
@@ -70,6 +79,7 @@
 #define CURB_BOOLEAN_GETTER(type, attr)                             \
             type *ptr;                                              \
             TypedData_Get_Struct(self, type, &type##_data_type, ptr); \
+            CURB_CHECK_ACCESS_##type(ptr);                          \
                                                                     \
             return((ptr->attr) ? Qtrue : Qfalse);
 
@@ -79,6 +89,7 @@
             VALUE oldproc;                                          \
                                                                     \
             TypedData_Get_Struct(self, type, &type##_data_type, ptr); \
+            CURB_CHECK_ACCESS_##type(ptr);                          \
                                                                     \
             oldproc = ptr->handler;                                 \
             rb_scan_args(argc, argv, "0&", &ptr->handler);          \
@@ -91,6 +102,7 @@
             VALUE oldproc, newproc;                                     \
                                                                         \
             TypedData_Get_Struct(self, type, &type##_data_type, ptr);   \
+            CURB_CHECK_ACCESS_##type(ptr);                          \
                                                                         \
             oldproc = rb_hash_aref(ptr->opts, rb_easy_hkey(#handler));   \
             rb_scan_args(argc, argv, "0&", &newproc);                   \
@@ -104,6 +116,7 @@
             type *ptr;                                              \
                                                                     \
             TypedData_Get_Struct(self, type, &type##_data_type, ptr); \
+            CURB_CHECK_ACCESS_##type(ptr);                          \
             if (attr == Qnil) {                                     \
               ptr->attr = nilval;                                   \
             } else {                                                \
@@ -117,6 +130,7 @@
             type *ptr;                                              \
                                                                     \
             TypedData_Get_Struct(self, type, &type##_data_type, ptr); \
+            CURB_CHECK_ACCESS_##type(ptr);                          \
             if (ptr->attr == nilval) {                              \
               return Qnil;                                          \
             } else {                                                \
@@ -128,6 +142,7 @@
             type *ptr;                                              \
                                                                     \
             TypedData_Get_Struct(self, type, &type##_data_type, ptr); \
+            CURB_CHECK_ACCESS_##type(ptr);                          \
             if (attr == Qnil) {                                     \
               ptr->attr = 0;                                        \
             } else {                                                \
@@ -147,6 +162,7 @@
             type *ptr;                                              \
                                                                     \
             TypedData_Get_Struct(self, type, &type##_data_type, ptr); \
+            CURB_CHECK_ACCESS_##type(ptr);                          \
             if (ptr->attr == 0) {                                   \
               return Qnil;                                          \
             } else {                                                \

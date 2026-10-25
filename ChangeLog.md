@@ -1,4 +1,73 @@
 # ChangeLog
+## 1.4.1 (unreleased)
+* Fix CI fixtures for Windows file-URL normalization and libcurl/libpsl localhost cookie loading. Keep parallel multipart Ractor coverage on Windows without triggering Ruby VM bug #21537 through explicit worker GC; retain multipart compaction coverage in the PostField tests. Include this changelog and the transfer-guard regression tests in the gem package.
+* Make `Curl.safe!` default to `network_policy = :public`, including calls without a configuration block. Global safe mode, `safe_*` helpers, and `Easy#safe_http!` now default to a configurable 10 MiB response-body cap, enforced for buffered responses and body callbacks. Explicit helper limits cannot weaken a tighter global cap. Trusted private destinations require an explicit global policy opt-out; raw requests outside safe mode retain their existing defaults. Add regression coverage for default SSRF blocking, multi policy refresh, body limits, and explicit overrides.
+* Complete idle easy-handle detachment during repeated `initialize`, `close`, and `reset`: clear native attachment counts and Ruby request bookkeeping so the handle can be re-added immediately. Check failed libcurl escape/unescape allocations before accessing their results, raising `Curl::Err::CurlError`, and free returned buffers even if Ruby string allocation raises.
+* Guard active multi transfers across GVL-releasing waits: reject access to attached easy handles and native multi mutations from other threads, including close/reset/clone, option changes, and removal. Reject destructive easy lifecycle operations and `setopt` while a transfer is active, while preserving cloning from callbacks on the performing thread. Release ownership on exceptions and interruption, and preserve it when reusing an autoclosed multi. Add concurrency regression tests for polling and socket-action performs.
+* Protect multipart form construction from reentrant `Curl::Easy` access during field callbacks and string coercion, and keep the native lifecycle guard active through form cleanup. Use private native snapshots for multipart payloads so later callbacks, threads, or GC compaction cannot invalidate earlier fields. Avoid per-field VM-global GC root registration and an extra libcurl form copy; release temporary metadata snapshots immediately after form construction. Add regression coverage for POST/PATCH/PUT, exception recovery, string mutation, and compaction.
+* Fix compiler-dependent crashes in multipart `Curl::PostField` uploads by coercing direct and block-provided content to strings before reading their pointers and lengths. Preserve `TypeError` for values without valid `to_str` conversion. Add regression coverage for content and buffered file fields, optional content types, and embedded NUL bytes.
+* Fix SSRF protection in `Curl.safe_*` and `Curl::Easy#safe_http!`: enforce `network_policy = :public` alongside HTTP/HTTPS protocol limits, blocking loopback, private, and link-local destinations by default. Apply existing proxy and destination-override controls, and prevent weaker global or per-handle network policies from disabling protection. Safe helpers now reject trusted local services too; use raw helpers with explicit protocol limits for those requests. Response-body limits use the safe-mode default and can be configured through `max_body_bytes`. Add regression coverage for safe helpers, policy reapplication, and multi transfers.
+* Fix crashes and uninitialized-memory reads when native operations are called on `Curl::Easy.allocate` or subclasses whose initializer omits `super`: reject uninitialized handles with `Curl::Err::FailedInitError`, initialize connection-info outputs, and check libcurl errors. Repeated `initialize` now detaches and frees the previous handle and rejects reinitialization during callbacks or native operations. Add regression coverage for allocation, subclasses, getters, lifecycle operations, and repeated initialization.
+* Fix a use-after-free when `Curl::Easy#clone` or `#dup` is called from a callback during a multipart request: detach the temporary form from the clone before the original request frees it, and reset the clone's callback state. Supply new `PostField` objects to send a multipart request with the clone. Add regression coverage for body, header, progress, debug, and completion callbacks.
+
+## 1.4.0
+* Fix crashes when a user-supplied value's `#to_s` returns a non-String (e.g. a Fixnum): `Curl::PostField#to_s` (name and content coercion), `Curl::Easy#http_auth_types=`, and `Curl::Easy#escape` now use `rb_obj_as_string` instead of trusting a raw `#to_s` result, and `Curl::Easy#unescape` coerces its argument before use. Previously these passed the unchecked result straight to raw C string macros (`RSTRING_PTR`/`RSTRING_LEN`), which could segfault instead of raising.
+* Fix `Curl::Easy#http_auth_types = [:basic, :digest]` (the documented array form), which previously stringified the whole Array and set no auth types.
+* `Curl::Easy#proxy_auth_types=` now accepts auth type symbols (`:basic`, `[:basic, :ntlm]`, etc.) like `http_auth_types=`, in addition to an Integer mask.
+* Fix a curl handle leak in `Curl::PostField#to_s` when the content proc, `#to_s`, or UTF-8 conversion raised.
+* Add guarded Ractor support on Ruby 3.0+ with thread-safe libcurl builds: isolate mutable configuration and cleanup queues per Ractor, freeze exported string constants, default Easy handles to `CURLOPT_NOSIGNAL`, and cover concurrent Easy requests with regression tests.
+* `Curl::Multi#perform` now waits with `curl_multi_poll` (libcurl 7.68+) instead of `curl_multi_fdset`/`select`. Sockets numbered above `FD_SETSIZE` (1024), common in long-running servers, no longer fall back to fixed 100ms sleeps (20 sequential GETs: 4.0s → 12ms); `Thread#raise`, `Thread#kill` and signals interrupt the wait immediately through `curl_multi_wakeup`; and idle waits follow libcurl's timeout instead of a fixed 100ms sleep. Older libcurl keeps the previous wait loop.
+* Under a Fiber scheduler, the socket-action loop now mirrors libcurl's sockets into one epoll (Linux) or kqueue (macOS/BSD) descriptor and waits on it with the scheduler's `io_wait` hook. This avoids the optional `io_select` hook, which Async implements by starting a thread per call (50 concurrent downloads with a CPU-busy Ruby thread: 637ms → 131ms), and fixes schedulers without `io_select` waiting up to `Curl::Multi.default_timeout` behind an idle socket. Platforms without epoll/kqueue keep the previous paths.
+* Make completion processing in `Curl::Multi` O(1) per finished transfer instead of copying every attached handle (16,000 transfers: 6.5s → 2.6s).
+* Scheduler-driven `Curl::Easy#perform` now queues completions instead of scanning every waiter on each drive-loop pass.
+* Fix an invalid `timeval` in the fallback wait loop when `Curl::Multi.default_timeout` exceeds 1000, and drop a retry loop for `CURLM_CALL_MULTI_PERFORM`, which libcurl has not returned since 7.20.
+* Test suite: fix cookie-list tests on libcurl 8.22+ with libpsl (#483), fix a WEBrick teardown race that could hang CI (notably the valgrind job), space fiber stacks apart in `rake test:valgrind` so valgrind tracks fiber switches instead of reporting false invalid reads, skip wall-clock bounds under valgrind, and add coverage for the new wait paths, poller cleanup, and completion/waiter bookkeeping.
+
+## 1.3.7
+* Pin `Curl::Easy` wrappers during GC compaction so libcurl completion dispatch cannot follow a stale Ruby object reference (#482).
+* Fix FTP option configuration (#481): add `Curl::Easy#ftp_create_missing_dirs` and its setter, export the available `CURLFTP_CREATE_DIR_*` mode constants, and route detected scalar/string FTP options through `Curl::Easy#set`.
+* Make `Curl::Multi#perform` and scheduler-driven `Curl::Easy#perform` nonblocking under Fiber schedulers while preserving cancellation and final-yield behavior, including schedulers without `io_select`.
+
+## 1.3.6
+* Removing long standing potential for mis-use with the Thread.current caching of easy handles (potentially a breaking change for some but more likely a fix)
+* Add safe request mode for fetching untrusted HTTP(S) URLs: `Curl.safe!`, `Curl.safe_get`, and `Curl::Easy#safe_http!`.
+* Add `CURLOPT_CONNECT_TO`, `Curl::Easy#connect_to`, `CURLOPT_DOH_URL`, `Curl::Easy#doh_url`, and DoH SSL verification options.
+* Restore Ruby 2.6 CI coverage and fix `Curl::Easy#perform` on Ruby 2.6 by avoiding finalizer-backed `ObjectSpace::WeakMap` entries for idle `Curl::Easy` references, including frozen easy handles.
+* Extend Ruby 4.0.x valgrind test handling to Ruby 4.0.5 by filtering Ruby VM Fiber/block-handler noise while preserving reports for errors originating in `curb_core`.
+* Harden `Curl::Easy`/`Curl::Multi` cleanup against re-entrant close during coercion and stale multi attachments.
+
+## 1.3.5
+* Improve Ruby 4.0.4 valgrind test handling by filtering Ruby VM Fiber/block-handler noise while preserving reports for errors originating in `curb_core`.
+* Fix `Curl::Multi` socket-action Fiber scheduler handling with libcurl 8.20.0 by honoring libcurl timer deadlines, matching Ruby IO wrapper modes to socket interest, and using scheduler `io_select` for multi-fd waits.
+* Fix `Curl::Multi#perform` so work added during the final idle yield is processed before autoclose, avoiding dropped queued requests.
+
+## 1.3.4
+* Fix `Curl::Multi` socket-action dispatch so ready sockets are collected before calling back into libcurl, avoiding invalid access when socket interest changes during iteration.
+* Keep the Fiber scheduler socket-action IO cache registered with Ruby GC during `_socket_perform` and clear it during cleanup, avoiding stale Ruby object references under valgrind.
+* Make Fiber scheduler tests avoid hardcoded port `9993` so local listeners or concurrent valgrind runs do not break the release suite.
+
+## 1.3.3
+* Skip the NTLM-specific username/password assertion when libcurl was built without NTLM support so newer libcurl builds do not fail by falling back to Basic auth.
+* Fix `Curl::Easy#put_data=` with non-String `to_s` payloads so upload length calculation does not read non-String objects as Ruby strings.
+* Guard `Curl::Easy#clone` against `curl_easy_duphandle` allocation failure so clone raises `NoMemError` instead of dereferencing a NULL handle.
+* Guard `Curl::Multi` lifecycle during active `perform` calls so closing a multi handle from callbacks or perform blocks raises instead of freeing an in-use libcurl multi handle.
+* Reject adding an active `Curl::Easy` handle to a second `Curl::Multi` before setup mutates request state.
+* Restore one-shot request state for `HEAD`, `PATCH`, and `PUT` requests after success or callback/error unwinds so later requests do not inherit stale method/body options.
+* Validate `Curl::Easy#put_data=` before mutating libcurl upload options, preventing failed setup paths from leaving stale upload callbacks installed.
+* Preserve `CURLOPT_RESOLVE` values set through `Easy#set` across repeated performs, and allow resolve/FTP command entries that convert to strings.
+* Fix older build fallback paths for `curl_multi_wait` and no-GVL `select`.
+* Fix the Fiber scheduler socket-action path so single-socket waits pass the actual ready events back to libcurl, avoiding incomplete HTTP responses on macOS CI.
+* Make legacy bug tests avoid hardcoded port `9999` so local SSH tunnels or other listeners do not break the release suite.
+* Add regression coverage for multi lifecycle guards, active easy reuse, request state cleanup, upload setup rollback, resolve persistence, string-convertible resolve/FTP command entries, and scheduler socket waits.
+
+## 1.3.2
+* Fix `Curl::PostField` GC marking so block-backed content fields remain valid across GC and compaction.
+* Fix upload read/seek callbacks to preserve Ruby exceptions, avoid unsafe unwinds through libcurl, and reject reads larger than libcurl's supplied buffer.
+* Fix multipart POST/PATCH/PUT cleanup so partially built native forms are freed when form construction raises.
+* Restore `Curl::Easy#last_error` after `Easy#close` by reattaching the libcurl error buffer to the reinitialized handle.
+* Fix `Curl::Easy#clone` with `put_data` so upload callbacks and upload state belong to the clone instead of the original handle.
+* Add regression coverage for native callback, multipart cleanup, clone upload, close/error-buffer, and `PostField` GC safety.
+
 ## 1.3.1
 * Fix Ruby 4.x compatibility in `Curl::Multi`
 

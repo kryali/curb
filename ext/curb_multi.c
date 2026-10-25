@@ -28,6 +28,12 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#ifndef _WIN32
+#include <sys/time.h>
+#include <time.h>
+#endif
+#include <limits.h>
+#include <stdint.h>
 #include <stdarg.h>
 
 /*
@@ -47,14 +53,50 @@
 #define CURB_MAYBE_UNUSED_DECL
 #endif
 
+/* Older rubies do not define UNDEF_P. */
+#ifndef UNDEF_P
+#define UNDEF_P(obj) ((VALUE)(obj) == Qundef)
+#endif
+
 #ifdef _WIN32
   // for O_RDWR and O_BINARY
   #include <fcntl.h>
 #endif
 
-#if 0 /* disabled curl_multi_wait in favor of scheduler-aware fdsets */
-#include <stdint.h>  /* for intptr_t */
+/*
+ * Prefer curl_multi_poll for the blocking perform loop: it uses poll(), so it
+ * has no FD_SETSIZE limit (select-based waiting cannot see sockets numbered
+ * above 1024 and degrades to fixed sleeps), and curl_multi_wakeup lets the
+ * unblocking function end the wait immediately for Thread#raise, Thread#kill
+ * and signal delivery.
+ */
+#if defined(HAVE_CURL_MULTI_POLL) && defined(HAVE_CURL_MULTI_WAKEUP) && defined(HAVE_RB_THREAD_CALL_WITHOUT_GVL)
+#define CURB_USE_MULTI_POLL 1
+#endif
 
+#ifdef CURB_USE_MULTI_POLL
+struct multi_poll_args {
+  CURLM *handle;
+  int timeout_ms;
+  int numfds;
+  CURLMcode code;
+};
+
+static void *curb_multi_poll_without_gvl(void *p) {
+  struct multi_poll_args *args = p;
+  args->code = curl_multi_poll(args->handle, NULL, 0, args->timeout_ms, &args->numfds);
+  return NULL;
+}
+
+/* Unblocking function: curl_multi_wakeup is safe to call from another thread
+ * while curl_multi_poll is blocked on the same handle. A wakeup that arrives
+ * after the poll returned only makes the next poll return early once. */
+static void curb_multi_poll_ubf(void *handle) {
+  curl_multi_wakeup((CURLM *)handle);
+}
+#endif
+
+#if defined(HAVE_CURL_MULTI_WAIT) && !defined(HAVE_RB_THREAD_FD_SELECT) && !defined(CURB_USE_MULTI_POLL)
 struct wait_args {
   CURLM *handle;
   long timeout_ms;
@@ -67,10 +109,101 @@ static void *curl_multi_wait_wrapper(void *p) {
 }
 #endif
 
+static VALUE cRubyFiber;
+static VALUE cRubyRactor;
+static ID id_fiber_blocking_p;
+static ID id_fiber_scheduler;
+static ID id_kernel_sleep;
+static ID id_io_wait;
+static ID id_ractor_current;
+static ID id_ractor_aref;
+static ID id_ractor_aset;
+static ID id_ractor_default_timeout_key;
+static ID id_ractor_autoclose_key;
+
+/*
+ * Ruby 3.0 introduced the Fiber scheduler at the Ruby level, but did not ship
+ * the public ruby/fiber/scheduler.h C API. Use the public C entry points when
+ * available and otherwise dispatch through Fiber and the scheduler object.
+ */
+static VALUE curb_fiber_scheduler_current(void) {
+#if defined(HAVE_RB_FIBER_SCHEDULER_CURRENT)
+  return rb_fiber_scheduler_current();
+#else
+  VALUE scheduler;
+
+  if (!rb_respond_to(cRubyFiber, id_fiber_scheduler)) return Qnil;
+
+  scheduler = rb_funcall(cRubyFiber, id_fiber_scheduler, 0);
+  if (NIL_P(scheduler)) return Qnil;
+
+  /* Fiber.scheduler returns the thread scheduler even from a blocking fiber,
+   * while rb_fiber_scheduler_current returns nil there. Match the latter so
+   * ordinary blocking fibers keep using the legacy multi loop. */
+  if (rb_respond_to(cRubyFiber, id_fiber_blocking_p) &&
+      RTEST(rb_funcall(cRubyFiber, id_fiber_blocking_p, 0))) {
+    return Qnil;
+  }
+
+  return scheduler;
+#endif
+}
+
+static VALUE curb_fiber_scheduler_kernel_sleep(VALUE scheduler, VALUE timeout) {
+#if defined(HAVE_RB_FIBER_SCHEDULER_KERNEL_SLEEP)
+  return rb_fiber_scheduler_kernel_sleep(scheduler, timeout);
+#else
+  return rb_funcall(scheduler, id_kernel_sleep, 1, timeout);
+#endif
+}
+
+static VALUE curb_fiber_scheduler_io_wait(VALUE scheduler, VALUE io, VALUE events, VALUE timeout) {
+#if defined(HAVE_RB_FIBER_SCHEDULER_IO_WAIT)
+  return rb_fiber_scheduler_io_wait(scheduler, io, events, timeout);
+#else
+  return rb_funcall(scheduler, id_io_wait, 3, io, events, timeout);
+#endif
+}
+
+/*
+ * Sleep for the given interval without stalling sibling fibers: when the
+ * current fiber runs under a fiber scheduler, wait via the scheduler's
+ * kernel_sleep hook. rb_thread_fd_select(0, ...) and rb_thread_wait_for are
+ * thread-level waits that never consult the scheduler, so they are only used
+ * when no scheduler is active.
+ */
+static void curb_multi_scheduler_sleep(struct timeval *tv) {
+  VALUE scheduler = curb_fiber_scheduler_current();
+  if (scheduler != Qnil) {
+    curb_fiber_scheduler_kernel_sleep(scheduler, rb_float_new((double)tv->tv_sec + ((double)tv->tv_usec / 1e6)));
+    return;
+  }
+#ifdef HAVE_RB_THREAD_FD_SELECT
+  {
+    struct timeval tv_sleep = *tv;
+    rb_thread_fd_select(0, NULL, NULL, NULL, &tv_sleep);
+  }
+#else
+  rb_thread_wait_for(*tv);
+#endif
+}
+
+/* Yield a nonblocking fiber without changing legacy behavior when no
+ * scheduler is active. */
+static void curb_multi_scheduler_yield(void) {
+  VALUE scheduler = curb_fiber_scheduler_current();
+  if (scheduler != Qnil) {
+    curb_fiber_scheduler_kernel_sleep(scheduler, INT2FIX(0));
+  }
+}
+
 extern VALUE mCurl;
 static VALUE idCall;
 static ID id_deferred_exception_ivar;
 static ID id_deferred_exception_source_id_ivar;
+static ID id_native_safety_signatures_ivar;
+static ID id_socket_io_cache_ivar;
+static ID id_socket_poller_io_ivar;
 
 #ifdef RDOC_NEVER_DEFINED
   mCurl = rb_define_module("Curl");
@@ -80,6 +213,32 @@ VALUE cCurlMulti;
 
 static long cCurlMutiDefaulttimeout = 100; /* milliseconds */
 static char cCurlMutiAutoClose = 0;
+
+/* Ruby 3.0+ provides storage owned by the current Ractor. Keep configurable
+ * defaults there so separate Ractors never race on process-global C values.
+ * Rubies without Ractor retain the historical process-wide settings. */
+static VALUE curb_multi_ractor_setting(ID key) {
+  VALUE current;
+
+  if (NIL_P(cRubyRactor)) return Qundef;
+  current = rb_funcall(cRubyRactor, id_ractor_current, 0);
+  return rb_funcall(current, id_ractor_aref, 1, ID2SYM(key));
+}
+
+static void curb_multi_set_ractor_setting(ID key, VALUE value) {
+  VALUE current = rb_funcall(cRubyRactor, id_ractor_current, 0);
+  rb_funcall(current, id_ractor_aset, 2, ID2SYM(key), value);
+}
+
+static long curb_multi_default_timeout(void) {
+  VALUE value = curb_multi_ractor_setting(id_ractor_default_timeout_key);
+  return (UNDEF_P(value) || NIL_P(value)) ? cCurlMutiDefaulttimeout : NUM2LONG(value);
+}
+
+static int curb_multi_autoclose_enabled(void) {
+  VALUE value = curb_multi_ractor_setting(id_ractor_autoclose_key);
+  return (UNDEF_P(value) || NIL_P(value)) ? cCurlMutiAutoClose == 1 : RTEST(value);
+}
 
 static void rb_curl_mutli_handle_complete(VALUE self, CURL *easy_handle, int result);
 static void rb_curl_multi_remove(ruby_curl_multi *rbcm, VALUE easy);
@@ -91,10 +250,38 @@ static void rb_curl_multi_detach_all(ruby_curl_multi *rbcm);
 static void curl_multi_mark(void *ptr);
 static void ruby_curl_multi_ensure_handle(ruby_curl_multi *rbcm);
 static int rb_curl_multi_has_easy(ruby_curl_multi *rbcm, ruby_curl_easy *rbce);
-static void rb_curl_multi_remove_request_reference(VALUE self, VALUE easy);
+void rb_curl_multi_remove_request_reference(VALUE self, VALUE easy);
 static VALUE ruby_curl_multi_mark_closed(VALUE self);
 static VALUE ruby_curl_multi_alloc(VALUE klass);
 static VALUE ruby_curl_multi_initialize(VALUE self);
+static VALUE ruby_curl_multi_perform_impl(int argc, VALUE *argv, VALUE self);
+#if defined(HAVE_CURL_MULTI_SOCKET_ACTION) && defined(HAVE_CURLMOPT_SOCKETFUNCTION) && defined(HAVE_CURLMOPT_TIMERFUNCTION) && defined(HAVE_RB_THREAD_FD_SELECT) && !defined(_WIN32)
+static VALUE ruby_curl_multi_socket_perform_impl(int argc, VALUE *argv, VALUE self);
+#endif
+
+static ruby_curl_multi *ruby_curl_multi_pointer_if_compatible(VALUE multi_val) {
+  if (NIL_P(multi_val) || !RB_TYPE_P(multi_val, T_DATA)) {
+    return NULL;
+  }
+
+#if defined(RTYPEDDATA_P) && defined(RTYPEDDATA_TYPE) && defined(RTYPEDDATA_DATA)
+  if (!RTYPEDDATA_P(multi_val)) {
+    return NULL;
+  }
+
+  if (RTYPEDDATA_TYPE(multi_val) != &ruby_curl_multi_data_type) {
+    return NULL;
+  }
+
+  return (ruby_curl_multi *)RTYPEDDATA_DATA(multi_val);
+#else
+  if (!rb_typeddata_is_kind_of(multi_val, &ruby_curl_multi_data_type)) {
+    return NULL;
+  }
+
+  return DATA_PTR(multi_val);
+#endif
+}
 
 static VALUE callback_exception(VALUE did_raise, VALUE exception) {
   // TODO: we could have an option to enable exception reporting
@@ -254,6 +441,33 @@ void rb_curl_multi_forget_easy(ruby_curl_multi *rbcm, void *rbce_ptr) {
   st_delete(rbcm->attached, &key, NULL);
 }
 
+CURLMcode rb_curl_multi_detach_easy(ruby_curl_multi *rbcm, void *rbce_ptr) {
+  ruby_curl_easy *rbce = (ruby_curl_easy *)rbce_ptr;
+  st_data_t key;
+
+  if (!rbcm || !rbce || !rbcm->attached) {
+    return CURLM_OK;
+  }
+
+  key = (st_data_t)rbce;
+  if (!st_delete(rbcm->attached, &key, NULL)) {
+    return CURLM_OK;
+  }
+
+  if (rbcm->handle && rbce->curl) {
+    CURLMcode result = curl_multi_remove_handle(rbcm->handle, rbce->curl);
+    if (result != CURLM_OK) {
+      return result;
+    }
+  }
+
+  if (rbcm->active > 0) {
+    rbcm->active--;
+  }
+
+  return CURLM_OK;
+}
+
 static void rb_curl_multi_detach_all(ruby_curl_multi *rbcm) {
   if (!rbcm || !rbcm->attached) {
     return;
@@ -280,8 +494,32 @@ static int rb_curl_multi_has_easy(ruby_curl_multi *rbcm, ruby_curl_easy *rbce) {
   return st_lookup(rbcm->attached, (st_data_t)rbce, &value);
 }
 
-static void rb_curl_multi_remove_request_reference(VALUE self, VALUE easy) {
+/* Attachment, rather than easy.multi alone, distinguishes a live transfer
+ * from a completed easy whose status callback still sees its former multi. */
+int rb_curl_multi_easy_performing(void *rbce_ptr) {
+  ruby_curl_easy *rbce = (ruby_curl_easy *)rbce_ptr;
+  ruby_curl_multi *rbcm = ruby_curl_multi_pointer_if_compatible(rbce->multi);
+  return rbcm && rbcm->perform_active && rb_curl_multi_has_easy(rbcm, rbce);
+}
+
+static void ruby_curl_multi_check_thread(ruby_curl_multi *rbcm) {
+  if (rbcm->perform_active && rbcm->perform_thread != rb_thread_current()) {
+    rb_raise(rb_eRuntimeError, "Cannot access a Curl::Multi handle performing on another thread");
+  }
+}
+
+void rb_curl_multi_check_easy_thread(void *rbce_ptr) {
+  ruby_curl_easy *rbce = (ruby_curl_easy *)rbce_ptr;
+  ruby_curl_multi *rbcm = ruby_curl_multi_pointer_if_compatible(rbce->multi);
+  if (rbcm && rb_curl_multi_has_easy(rbcm, rbce)) {
+    ruby_curl_multi_check_thread(rbcm);
+  }
+}
+
+void rb_curl_multi_remove_request_reference(VALUE self, VALUE easy) {
   VALUE requests;
+  VALUE object_id;
+  VALUE safety_signatures;
 
   if (NIL_P(self) || NIL_P(easy)) {
     return;
@@ -292,7 +530,17 @@ static void rb_curl_multi_remove_request_reference(VALUE self, VALUE easy) {
     return;
   }
 
-  rb_hash_delete(requests, rb_obj_id(easy));
+  object_id = rb_obj_id(easy);
+  rb_hash_delete(requests, object_id);
+
+  if (!rb_ivar_defined(self, id_native_safety_signatures_ivar)) {
+    return;
+  }
+
+  safety_signatures = rb_ivar_get(self, id_native_safety_signatures_ivar);
+  if (RB_TYPE_P(safety_signatures, T_HASH)) {
+    rb_hash_delete(safety_signatures, object_id);
+  }
 }
 
 /* TypedData-compatible free function */
@@ -342,6 +590,10 @@ static void ruby_curl_multi_init(ruby_curl_multi *rbcm) {
   rbcm->active = 0;
   rbcm->running = 0;
   rbcm->closed = 0;
+  rbcm->perform_active = 0;
+  rbcm->perform_thread = Qnil;
+  rbcm->callback_active = 0;
+  rbcm->allow_close_during_perform = 0;
 
   if (rbcm->attached) {
     st_free_table(rbcm->attached);
@@ -357,6 +609,7 @@ static void ruby_curl_multi_init(ruby_curl_multi *rbcm) {
 }
 
 static void ruby_curl_multi_ensure_handle(ruby_curl_multi *rbcm) {
+  ruby_curl_multi_check_thread(rbcm);
   if (!rbcm->handle) {
     if (rbcm->closed) {
       raise_curl_multi_error_exception(CURLM_BAD_HANDLE);
@@ -386,6 +639,10 @@ static VALUE ruby_curl_multi_initialize(VALUE self) {
 
   TypedData_Get_Struct(self, ruby_curl_multi, &ruby_curl_multi_data_type, rbcm);
 
+  if (rbcm->perform_active) {
+    rb_raise(rb_eRuntimeError, "Cannot initialize an active Curl::Multi handle during perform");
+  }
+
   ruby_curl_multi_init(rbcm);
 
   /*
@@ -401,12 +658,18 @@ static VALUE ruby_curl_multi_initialize(VALUE self) {
  * call-seq:
  *   Curl::Multi.default_timeout = 4 => 4
  *
- * Set the global default time out for all Curl::Multi Handles.  This value is used
- * when libcurl cannot determine a timeout value when calling curl_multi_timeout.
+ * Set the default timeout for Curl::Multi handles in the current Ractor. On
+ * Rubies without Ractor this remains process-wide. This value is used when
+ * libcurl cannot determine a timeout value when calling curl_multi_timeout.
  *
  */
 VALUE ruby_curl_multi_set_default_timeout(VALUE klass, VALUE timeout) {
-  cCurlMutiDefaulttimeout = NUM2LONG(timeout);
+  long value = NUM2LONG(timeout);
+  if (NIL_P(cRubyRactor)) {
+    cCurlMutiDefaulttimeout = value;
+  } else {
+    curb_multi_set_ractor_setting(id_ractor_default_timeout_key, LONG2NUM(value));
+  }
   return timeout;
 }
 
@@ -414,23 +677,29 @@ VALUE ruby_curl_multi_set_default_timeout(VALUE klass, VALUE timeout) {
  * call-seq:
  *   Curl::Multi.default_timeout = 4 => 4
  *
- * Get the global default time out for all Curl::Multi Handles.
+ * Get the current Ractor's default timeout for Curl::Multi handles.
  *
  */
 VALUE ruby_curl_multi_get_default_timeout(VALUE klass) {
-  return LONG2NUM(cCurlMutiDefaulttimeout);
+  return LONG2NUM(curb_multi_default_timeout());
 }
 
 /*
  * call-seq:
  *   Curl::Multi.autoclose = true => true
  *
- * Automatically close open connections after each request. Otherwise, the connection will remain open 
- * for reuse until the next GC
+ * Automatically close open connections after each request in the current
+ * Ractor. Otherwise, the connection will remain open for reuse until the next
+ * GC.
  *
  */
 VALUE ruby_curl_multi_set_autoclose(VALUE klass, VALUE onoff) {
-  cCurlMutiAutoClose = ((onoff == Qtrue) ? 1 : 0);
+  VALUE value = onoff == Qtrue ? Qtrue : Qfalse;
+  if (NIL_P(cRubyRactor)) {
+    cCurlMutiAutoClose = RTEST(value) ? 1 : 0;
+  } else {
+    curb_multi_set_ractor_setting(id_ractor_autoclose_key, value);
+  }
   return onoff;
 }
 
@@ -438,11 +707,11 @@ VALUE ruby_curl_multi_set_autoclose(VALUE klass, VALUE onoff) {
  * call-seq:
  *   Curl::Multi.autoclose => true|false
  *
- * Get the global default autoclose setting for all Curl::Multi Handles.
+ * Get the current Ractor's default autoclose setting for Curl::Multi handles.
  *
  */
 VALUE ruby_curl_multi_get_autoclose(VALUE klass) {
-  return cCurlMutiAutoClose == 1 ? Qtrue : Qfalse;
+  return curb_multi_autoclose_enabled() ? Qtrue : Qfalse;
 }
 
 /*
@@ -537,10 +806,20 @@ VALUE ruby_curl_multi_add(VALUE self, VALUE easy) {
   CURLMcode mcode;
   ruby_curl_easy *rbce;
   ruby_curl_multi *rbcm;
+  ruby_curl_multi *existing_rbcm;
 
   TypedData_Get_Struct(self, ruby_curl_multi, &ruby_curl_multi_data_type, rbcm);
-  TypedData_Get_Struct(easy, ruby_curl_easy, &ruby_curl_easy_data_type, rbce);
+  rbce = ruby_curl_easy_get_handle(easy);
   ruby_curl_multi_ensure_handle(rbcm);
+
+  if (rb_curl_multi_has_easy(rbcm, rbce)) {
+    return self;
+  }
+
+  existing_rbcm = ruby_curl_multi_pointer_if_compatible(rbce->multi);
+  if (existing_rbcm && existing_rbcm != rbcm && rb_curl_multi_has_easy(existing_rbcm, rbce)) {
+    rb_raise(rb_eRuntimeError, "Cannot add an active Curl::Easy handle to another Curl::Multi");
+  }
 
   /* setup the easy handle */
   ruby_curl_easy_setup( rbce );
@@ -567,7 +846,7 @@ VALUE ruby_curl_multi_add(VALUE self, VALUE easy) {
     }
   }
 
-  rbce->multi_attachment_generation++;
+  rbce->multi_attachment_generation = ++rbcm->attachment_sequence;
   st_insert(rbcm->attached, (st_data_t)rbce, (st_data_t)easy);
 
   /* track a reference to associated multi handle */
@@ -595,6 +874,7 @@ VALUE ruby_curl_multi_remove(VALUE self, VALUE rb_easy_handle) {
 
   TypedData_Get_Struct(self, ruby_curl_multi, &ruby_curl_multi_data_type, rbcm);
 
+  ruby_curl_multi_check_thread(rbcm);
   rb_curl_multi_remove(rbcm, rb_easy_handle);
 
   return self;
@@ -604,7 +884,7 @@ static void rb_curl_multi_remove(ruby_curl_multi *rbcm, VALUE easy) {
   CURLMcode result;
   ruby_curl_easy *rbce;
 
-  TypedData_Get_Struct(easy, ruby_curl_easy, &ruby_curl_easy_data_type, rbce);
+  rbce = ruby_curl_easy_get_handle(easy);
   result = curl_multi_remove_handle(rbcm->handle, rbce->curl);
   if (result != 0) {
     raise_curl_multi_error_exception(result);
@@ -687,42 +967,17 @@ struct multi_complete_callback_args {
   ruby_curl_multi *rbcm;
   ruby_curl_easy *rbce;
   int result;
-  st_table *attached_snapshot;
+  /* rbcm->attachment_sequence before the callbacks ran; easies stamped later
+   * were attached (or re-attached) by the callbacks. */
+  unsigned long attachment_sequence_before;
 };
 
-static int snapshot_attached_easy_i(st_data_t key, st_data_t val, st_data_t arg) {
-  st_table *snapshot = (st_table *)arg;
-  ruby_curl_easy *rbce = (ruby_curl_easy *)key;
-
-  if (!rbce) {
-    return ST_CONTINUE;
-  }
-
-  st_insert(snapshot, key, (st_data_t)rbce->multi_attachment_generation);
-  return ST_CONTINUE;
-}
-
-static st_table *capture_attached_easy_snapshot(ruby_curl_multi *rbcm) {
-  st_table *snapshot = st_init_numtable();
-
-  if (!snapshot) {
-    rb_raise(rb_eNoMemError, "Failed to allocate multi callback snapshot table");
-  }
-
-  if (rbcm && rbcm->attached) {
-    st_foreach(rbcm->attached, snapshot_attached_easy_i, (st_data_t)snapshot);
-  }
-
-  return snapshot;
-}
-
 struct collect_new_attached_easies_ctx {
-  st_table *snapshot;
+  unsigned long attachment_sequence_before;
   VALUE easies;
 };
 
 static int collect_new_attached_easies_i(st_data_t key, st_data_t val, st_data_t arg) {
-  st_data_t existing = 0;
   ruby_curl_easy *rbce = (ruby_curl_easy *)key;
   struct collect_new_attached_easies_ctx *ctx = (struct collect_new_attached_easies_ctx *)arg;
 
@@ -730,24 +985,25 @@ static int collect_new_attached_easies_i(st_data_t key, st_data_t val, st_data_t
     return ST_CONTINUE;
   }
 
-  if (!ctx->snapshot || !st_lookup(ctx->snapshot, key, &existing) ||
-      existing != (st_data_t)rbce->multi_attachment_generation) {
+  if (rbce->multi_attachment_generation > ctx->attachment_sequence_before) {
     rb_ary_push(ctx->easies, (VALUE)val);
   }
 
   return ST_CONTINUE;
 }
 
-static void rb_curl_multi_remove_added_easies_since_snapshot(VALUE self, ruby_curl_multi *rbcm, st_table *snapshot) {
+/* Only runs when a completion callback raised, so this walk over the
+ * attached table stays off the per-completion path. */
+static void rb_curl_multi_remove_easies_attached_since(VALUE self, ruby_curl_multi *rbcm, unsigned long attachment_sequence_before) {
   struct collect_new_attached_easies_ctx ctx;
   VALUE easies = rb_ary_new();
   long index;
 
-  if (!rbcm || !snapshot || !rbcm->attached) {
+  if (!rbcm || !rbcm->attached) {
     return;
   }
 
-  ctx.snapshot = snapshot;
+  ctx.attachment_sequence_before = attachment_sequence_before;
   ctx.easies = easies;
   st_foreach(rbcm->attached, collect_new_attached_easies_i, (st_data_t)&ctx);
 
@@ -784,7 +1040,7 @@ static void stash_and_raise_status_callback_error_if_unmasked(struct multi_compl
   }
 
   stash_multi_exception_if_unset(args->self, exception, args->easy);
-  rb_curl_multi_remove_added_easies_since_snapshot(args->self, args->rbcm, args->attached_snapshot);
+  rb_curl_multi_remove_easies_attached_since(args->self, args->rbcm, args->attachment_sequence_before);
   rb_exc_raise(exception);
 }
 
@@ -795,7 +1051,10 @@ static VALUE rb_curl_multi_run_completion_callbacks(VALUE argp) {
   VALUE easy_callback_error = Qnil;
   VALUE callargs;
   VALUE did_raise = rb_hash_new();
-  long redirect_count;
+  long redirect_count = 0;
+  CURLcode info_result;
+
+  args->rbcm->callback_active = 1;
 
   easy_callback_error = take_easy_callback_error_if_any(args->easy);
   if (!NIL_P(easy_callback_error)) {
@@ -811,12 +1070,18 @@ static VALUE rb_curl_multi_run_completion_callbacks(VALUE argp) {
   }
 
 #ifdef HAVE_CURLINFO_RESPONSE_CODE
-  curl_easy_getinfo(args->rbce->curl, CURLINFO_RESPONSE_CODE, &response_code);
+  info_result = curl_easy_getinfo(args->rbce->curl, CURLINFO_RESPONSE_CODE, &response_code);
 #else /* use fdsets path for waiting */
   // old libcurl
-  curl_easy_getinfo(args->rbce->curl, CURLINFO_HTTP_CODE, &response_code);
+  info_result = curl_easy_getinfo(args->rbce->curl, CURLINFO_HTTP_CODE, &response_code);
 #endif
-  curl_easy_getinfo(args->rbce->curl, CURLINFO_REDIRECT_COUNT, &redirect_count);
+  if (info_result != CURLE_OK) {
+    raise_curl_easy_error_exception(info_result);
+  }
+  info_result = curl_easy_getinfo(args->rbce->curl, CURLINFO_REDIRECT_COUNT, &redirect_count);
+  if (info_result != CURLE_OK) {
+    raise_curl_easy_error_exception(info_result);
+  }
 
   if (args->result != 0) {
     if (!rb_easy_nil("failure_proc")) {
@@ -877,13 +1142,12 @@ static VALUE rb_curl_multi_finish_completion_callbacks(VALUE argp) {
     args->rbce->callback_active = 0;
   }
 
-  if (args->rbce->multi == args->self && !rb_curl_multi_has_easy(args->rbcm, args->rbce)) {
-    args->rbce->multi = Qnil;
+  if (args->rbcm) {
+    args->rbcm->callback_active = 0;
   }
 
-  if (args->attached_snapshot) {
-    st_free_table(args->attached_snapshot);
-    args->attached_snapshot = NULL;
+  if (args->rbce->multi == args->self && !rb_curl_multi_has_easy(args->rbcm, args->rbce)) {
+    args->rbce->multi = Qnil;
   }
 
   return Qnil;
@@ -946,7 +1210,7 @@ static void rb_curl_mutli_handle_complete(VALUE self, CURL *easy_handle, int res
     rbcm,
     rbce,
     result,
-    capture_attached_easy_snapshot(rbcm)
+    rbcm->attachment_sequence
   };
   rb_ensure(rb_curl_multi_run_completion_callbacks, (VALUE)&args,
             rb_curl_multi_finish_completion_callbacks, (VALUE)&args);
@@ -993,21 +1257,14 @@ static void rb_curl_multi_run(VALUE self, CURLM *multi_handle, int *still_runnin
   CURLMcode mcode;
 
   /*
-   * curl_multi_perform will return CURLM_CALL_MULTI_PERFORM only when it wants to be called again immediately.
-   * When things are fine and there is nothing immediate it wants done, it'll return CURLM_OK.
-   *
-   * It will perform all pending actions on all added easy handles attached to this multi handle. We will loop
-   * here as long as mcode is CURLM_CALL_MULTIPERFORM.
+   * Perform all pending actions on every easy handle attached to this multi
+   * handle. libcurl stopped returning CURLM_CALL_MULTI_PERFORM here in 7.20
+   * (curb supports 7.58+); should it appear, treat it as success: the drive
+   * loop calls curl_multi_perform again on its next pass.
    */
-  do {
-    mcode = curl_multi_perform(multi_handle, still_running);
-  } while (mcode == CURLM_CALL_MULTI_PERFORM);
+  mcode = curl_multi_perform(multi_handle, still_running);
 
-  /*
-   * Nothing more to do, check if an error occured in the loop above and raise an exception if necessary.
-   */
-
-  if (mcode != CURLM_OK) {
+  if (mcode != CURLM_OK && mcode != CURLM_CALL_MULTI_PERFORM) {
     raise_curl_multi_error_exception(mcode);
   }
 
@@ -1022,11 +1279,55 @@ static void rb_curl_multi_run(VALUE self, CURLM *multi_handle, int *still_runnin
 
 #if defined(HAVE_CURL_MULTI_SOCKET_ACTION) && defined(HAVE_CURLMOPT_SOCKETFUNCTION) && defined(HAVE_CURLMOPT_TIMERFUNCTION) && defined(HAVE_RB_THREAD_FD_SELECT) && !defined(_WIN32)
 /* ---- socket-action implementation (scheduler-friendly) ---- */
+
+/*
+ * Under a fiber scheduler, mirror libcurl's socket interest into a kernel
+ * event queue (epoll or kqueue) and wait on that single descriptor with the
+ * scheduler's io_wait hook. Every scheduler implements io_wait, so this avoids
+ * the optional io_select hook (which Async implements by starting a thread
+ * per call) and the one-descriptor fallback for schedulers without it.
+ */
+#if defined(HAVE_SYS_EPOLL_H) && defined(HAVE_EPOLL_CREATE1)
+#include <sys/epoll.h>
+#define CURB_SOCKET_POLLER 1
+#define CURB_SOCKET_POLLER_EPOLL 1
+#define CURB_SOCKET_POLLER_NAME "epoll"
+#elif defined(HAVE_SYS_EVENT_H) && defined(HAVE_KQUEUE)
+#include <sys/types.h>
+#include <sys/event.h>
+#define CURB_SOCKET_POLLER 1
+#define CURB_SOCKET_POLLER_KQUEUE 1
+#define CURB_SOCKET_POLLER_NAME "kqueue"
+#endif
+
+/* Events harvested per poller read; more are collected on following rounds. */
+#define CURB_SOCKET_POLLER_BATCH 64
+
 typedef struct {
   st_table *sock_map;     /* key: int fd, value: int 'what' (CURL_POLL_*) */
-  long timeout_ms;        /* last timeout set by libcurl timer callback */
+  long long timeout_deadline_ms; /* absolute deadline for CURL_SOCKET_TIMEOUT */
   VALUE io_cache;         /* fd -> IO wrapper for fiber-scheduler waits */
+  int poller_fd;          /* epoll/kqueue descriptor, or -1 when unused */
+  VALUE poller_io;        /* IO wrapper for poller_fd passed to io_wait */
 } multi_socket_ctx;
+
+static long long multi_socket_current_time_ms(void) {
+#if defined(CLOCK_MONOTONIC)
+  struct timespec ts;
+  if (clock_gettime(CLOCK_MONOTONIC, &ts) == 0) {
+    return ((long long)ts.tv_sec * 1000) + (ts.tv_nsec / 1000000);
+  }
+#endif
+
+  struct timeval tv;
+  gettimeofday(&tv, NULL);
+  return ((long long)tv.tv_sec * 1000) + (tv.tv_usec / 1000);
+}
+
+static int multi_socket_timer_due(multi_socket_ctx *ctx) {
+  return ctx && ctx->timeout_deadline_ms >= 0 &&
+    multi_socket_current_time_ms() >= ctx->timeout_deadline_ms;
+}
 
 #if CURB_SOCKET_DEBUG
 static void curb_debugf(const char *fmt, ...) {
@@ -1063,12 +1364,99 @@ static const char *cselect_flags_str(int flags, char *buf, size_t n) {
 #define cselect_flags_str(...) ""
 #endif
 
-#if defined(HAVE_RB_FIBER_SCHEDULER_IO_WAIT) && defined(HAVE_RB_FIBER_SCHEDULER_CURRENT)
-/* Protected call to rb_fiber_scheduler_io_wait to avoid unwinding into C on TypeError. */
-struct fiber_io_wait_args { VALUE scheduler; VALUE io; VALUE events; VALUE timeout; };
-static VALUE fiber_io_wait_protected(VALUE argp) {
-  struct fiber_io_wait_args *a = (struct fiber_io_wait_args *)argp;
-  return rb_fiber_scheduler_io_wait(a->scheduler, a->io, a->events, a->timeout);
+#if defined(RB_INTEGER_TYPE_P)
+#define CURB_INTEGER_P(value) RB_INTEGER_TYPE_P(value)
+#else
+#define CURB_INTEGER_P(value) (FIXNUM_P(value) || RB_TYPE_P((value), T_BIGNUM))
+#endif
+
+static int multi_socket_wait_events_for_curl_poll(int what) {
+  if (what == CURL_POLL_IN) return RB_WAITFD_IN;
+  if (what == CURL_POLL_OUT) return RB_WAITFD_OUT;
+  if (what == CURL_POLL_INOUT) return RB_WAITFD_IN | RB_WAITFD_OUT;
+  return RB_WAITFD_IN | RB_WAITFD_OUT;
+}
+
+static int multi_socket_cselect_flags_for_curl_poll(int what) {
+  int flags = 0;
+
+  if (what == CURL_POLL_IN || what == CURL_POLL_INOUT) flags |= CURL_CSELECT_IN;
+  if (what == CURL_POLL_OUT || what == CURL_POLL_INOUT) flags |= CURL_CSELECT_OUT;
+  if (flags == 0) flags = CURL_CSELECT_IN | CURL_CSELECT_OUT;
+
+  return flags;
+}
+
+static int multi_socket_cselect_flags_for_wait_events(int events) {
+  int flags = 0;
+
+  if (events & RB_WAITFD_IN) flags |= CURL_CSELECT_IN;
+  if (events & RB_WAITFD_OUT) flags |= CURL_CSELECT_OUT;
+#ifdef RB_WAITFD_PRI
+  if (events & RB_WAITFD_PRI) flags |= CURL_CSELECT_ERR;
+#endif
+
+  return flags;
+}
+
+#ifdef CURB_SOCKET_POLLER
+static int multi_socket_poller_create(void) {
+#if defined(CURB_SOCKET_POLLER_EPOLL)
+  return epoll_create1(EPOLL_CLOEXEC);
+#else
+  int fd = kqueue();
+  if (fd >= 0) fcntl(fd, F_SETFD, FD_CLOEXEC);
+  return fd;
+#endif
+}
+
+/*
+ * Bring the poller's interest for fd from old_what to new_what, where each is
+ * a CURL_POLL_IN/OUT/INOUT mask and 0 means "not registered". Registration is
+ * level-triggered so readiness left unconsumed is reported again. Errors are
+ * ignored: the kernel drops closed descriptors from both epoll and kqueue on
+ * its own, so a stale delete or a re-add after fd reuse is harmless.
+ */
+static void multi_socket_poller_update(multi_socket_ctx *ctx, int fd, int old_what, int new_what) {
+  if (!ctx || ctx->poller_fd < 0 || old_what == new_what) return;
+#if defined(CURB_SOCKET_POLLER_EPOLL)
+  {
+    struct epoll_event ev;
+    memset(&ev, 0, sizeof(ev));
+    ev.data.fd = fd;
+    if (new_what & CURL_POLL_IN) ev.events |= EPOLLIN;
+    if (new_what & CURL_POLL_OUT) ev.events |= EPOLLOUT;
+
+    if (new_what == 0) {
+      epoll_ctl(ctx->poller_fd, EPOLL_CTL_DEL, fd, &ev);
+    } else if (old_what == 0) {
+      if (epoll_ctl(ctx->poller_fd, EPOLL_CTL_ADD, fd, &ev) != 0 && errno == EEXIST) {
+        epoll_ctl(ctx->poller_fd, EPOLL_CTL_MOD, fd, &ev);
+      }
+    } else if (epoll_ctl(ctx->poller_fd, EPOLL_CTL_MOD, fd, &ev) != 0 && errno == ENOENT) {
+      epoll_ctl(ctx->poller_fd, EPOLL_CTL_ADD, fd, &ev);
+    }
+  }
+#else
+  {
+    /* kqueue tracks read and write as separate filters. Apply each change on
+     * its own so one failing change cannot skip the others. */
+    struct kevent change;
+    int old_read = (old_what & CURL_POLL_IN) != 0;
+    int new_read = (new_what & CURL_POLL_IN) != 0;
+    int old_write = (old_what & CURL_POLL_OUT) != 0;
+    int new_write = (new_what & CURL_POLL_OUT) != 0;
+
+    if (old_read != new_read) {
+      EV_SET(&change, fd, EVFILT_READ, new_read ? EV_ADD : EV_DELETE, 0, 0, NULL);
+      kevent(ctx->poller_fd, &change, 1, NULL, 0, NULL);
+    }
+    if (old_write != new_write) {
+      EV_SET(&change, fd, EVFILT_WRITE, new_write ? EV_ADD : EV_DELETE, 0, 0, NULL);
+      kevent(ctx->poller_fd, &change, 1, NULL, 0, NULL);
+    }
+  }
+#endif
 }
 #endif
 
@@ -1077,7 +1465,11 @@ static void multi_socket_forget_fd(multi_socket_ctx *ctx, int fd) {
   st_data_t rec;
 
   if (!ctx) return;
-  if (ctx->sock_map) st_delete(ctx->sock_map, &key, &rec);
+  if (ctx->sock_map && st_delete(ctx->sock_map, &key, &rec)) {
+#ifdef CURB_SOCKET_POLLER
+    multi_socket_poller_update(ctx, fd, (int)rec, 0);
+#endif
+  }
   if (!NIL_P(ctx->io_cache)) rb_hash_delete(ctx->io_cache, INT2NUM(fd));
 }
 
@@ -1106,6 +1498,15 @@ static int multi_socket_cb(CURL *easy, curl_socket_t s, int what, void *userp, v
 #endif
   } else {
     /* store current interest mask for this fd */
+    st_data_t key = (st_data_t)fd;
+    st_data_t old_what = 0;
+    int tracked = st_lookup(ctx->sock_map, key, &old_what);
+    if (tracked && (int)old_what != what && !NIL_P(ctx->io_cache)) {
+      rb_hash_delete(ctx->io_cache, INT2NUM(fd));
+    }
+#ifdef CURB_SOCKET_POLLER
+    multi_socket_poller_update(ctx, fd, tracked ? (int)old_what : 0, what);
+#endif
     st_insert(ctx->sock_map, (st_data_t)fd, (st_data_t)what);
 #if CURB_SOCKET_DEBUG
     {
@@ -1120,7 +1521,9 @@ static int multi_socket_cb(CURL *easy, curl_socket_t s, int what, void *userp, v
 static int multi_timer_cb(CURLM *multi, long timeout_ms, void *userp) {
   (void)multi;
   multi_socket_ctx *ctx = (multi_socket_ctx *)userp;
-  if (ctx) ctx->timeout_ms = timeout_ms;
+  if (ctx) {
+    ctx->timeout_deadline_ms = timeout_ms < 0 ? -1 : multi_socket_current_time_ms() + timeout_ms;
+  }
   curb_debugf("[curb.socket] timer_cb timeout_ms=%ld", timeout_ms);
   return 0;
 }
@@ -1144,18 +1547,32 @@ static void rb_fdset_from_sockmap(st_table *map, rb_fdset_t *rfds, rb_fdset_t *w
   *maxfd_out = a.maxfd;
 }
 
-struct dispatch_args { CURLM *mh; int *running; CURLMcode mrc; rb_fdset_t *r; rb_fdset_t *w; rb_fdset_t *e; };
-static int dispatch_ready_fd_i(st_data_t key, st_data_t val, st_data_t argp) {
+struct ready_fd {
+  int fd;
+  int flags;
+};
+
+struct collect_ready_fd_args {
+  rb_fdset_t *r;
+  rb_fdset_t *w;
+  rb_fdset_t *e;
+  struct ready_fd *fds;
+  int capacity;
+  int count;
+};
+
+static int collect_ready_fd_i(st_data_t key, st_data_t val, st_data_t argp) {
   (void)val;
-  struct dispatch_args *dp = (struct dispatch_args *)argp;
+  struct collect_ready_fd_args *a = (struct collect_ready_fd_args *)argp;
   int fd = (int)key;
   int flags = 0;
-  if (rb_fd_isset(fd, dp->r)) flags |= CURL_CSELECT_IN;
-  if (rb_fd_isset(fd, dp->w)) flags |= CURL_CSELECT_OUT;
-  if (rb_fd_isset(fd, dp->e)) flags |= CURL_CSELECT_ERR;
-  if (flags) {
-    dp->mrc = curl_multi_socket_action(dp->mh, (curl_socket_t)fd, flags, dp->running);
-    if (dp->mrc != CURLM_OK) return ST_STOP;
+  if (rb_fd_isset(fd, a->r)) flags |= CURL_CSELECT_IN;
+  if (rb_fd_isset(fd, a->w)) flags |= CURL_CSELECT_OUT;
+  if (rb_fd_isset(fd, a->e)) flags |= CURL_CSELECT_ERR;
+  if (flags && a->count < a->capacity) {
+    a->fds[a->count].fd = fd;
+    a->fds[a->count].flags = flags;
+    a->count++;
   }
   return ST_CONTINUE;
 }
@@ -1169,51 +1586,241 @@ static int st_pick_one_i(st_data_t key, st_data_t val, st_data_t argp) {
   s->found = 1;
   return ST_STOP;
 }
-struct counter_state { int count; };
-static int st_count_i(st_data_t k, st_data_t v, st_data_t argp) {
-  (void)k; (void)v;
-  struct counter_state *c = (struct counter_state *)argp;
-  c->count++;
-  return ST_CONTINUE;
+
+static const char *multi_socket_io_mode_for_curl_poll(int what) {
+  if (what == CURL_POLL_IN) return "r";
+  if (what == CURL_POLL_OUT) return "w";
+  return "r+";
 }
 
-static VALUE multi_socket_io_for_fd(multi_socket_ctx *ctx, int fd) {
+static VALUE multi_socket_io_for_fd(multi_socket_ctx *ctx, int fd, int what) {
   VALUE key = INT2NUM(fd);
   VALUE io = rb_hash_aref(ctx->io_cache, key);
   if (NIL_P(io)) {
-    io = rb_funcall(rb_cIO, rb_intern("for_fd"), 2, key, rb_str_new_cstr("r+"));
+    io = rb_funcall(rb_cIO, rb_intern("for_fd"), 2, key, rb_str_new_cstr(multi_socket_io_mode_for_curl_poll(what)));
     rb_funcall(io, rb_intern("autoclose="), 1, Qfalse);
     rb_hash_aset(ctx->io_cache, key, io);
   }
   return io;
 }
 
-struct io_for_fd_args { multi_socket_ctx *ctx; int fd; };
+struct io_for_fd_args { multi_socket_ctx *ctx; int fd; int what; };
 static VALUE multi_socket_io_for_fd_protected(VALUE argp) {
   struct io_for_fd_args *a = (struct io_for_fd_args *)argp;
-  return multi_socket_io_for_fd(a->ctx, a->fd);
+  return multi_socket_io_for_fd(a->ctx, a->fd, a->what);
 }
 
-static void rb_curl_multi_socket_drive(VALUE self, ruby_curl_multi *rbcm, multi_socket_ctx *ctx, VALUE block) {
-  /* prime the state: let libcurl act on timeouts to setup sockets */
-  CURLMcode mrc = curl_multi_socket_action(rbcm->handle, CURL_SOCKET_TIMEOUT, 0, &rbcm->running);
-  if (mrc != CURLM_OK) raise_curl_multi_error_exception(mrc);
-  curb_debugf("[curb.socket] drive: initial socket_action timeout -> mrc=%d running=%d", mrc, rbcm->running);
-  rb_curl_multi_read_info(self, rbcm->handle);
-  rb_curl_multi_yield_if_given(self, block);
+#ifdef CURB_SOCKET_POLLER
+static VALUE multi_socket_poller_io(VALUE self, multi_socket_ctx *ctx) {
+  if (NIL_P(ctx->poller_io)) {
+    VALUE io = rb_funcall(rb_cIO, rb_intern("for_fd"), 2, INT2NUM(ctx->poller_fd), rb_str_new_cstr("r"));
+    /* The drive loop's ensure closes poller_fd itself. */
+    rb_funcall(io, rb_intern("autoclose="), 1, Qfalse);
+    ctx->poller_io = io;
+    rb_ivar_set(self, id_socket_poller_io_ivar, io);
+  }
+  return ctx->poller_io;
+}
 
-  while (rbcm->running) {
-    struct timeval tv = {0, 0};
-    if (ctx->timeout_ms < 0) {
-      tv.tv_sec = cCurlMutiDefaulttimeout / 1000;
-      tv.tv_usec = (cCurlMutiDefaulttimeout % 1000) * 1000;
-    } else {
-      long t = ctx->timeout_ms;
-      if (t > cCurlMutiDefaulttimeout) t = cCurlMutiDefaulttimeout;
-      if (t < 0) t = 0;
-      tv.tv_sec = t / 1000;
-      tv.tv_usec = (t % 1000) * 1000;
+/*
+ * Report readiness the way select() does: an error or hangup marks the socket
+ * ready for whatever libcurl is waiting on, and libcurl then observes the
+ * condition from the read or write itself. (CURL_CSELECT_ERR would make it
+ * fail the transfer outright, even with response data still buffered.)
+ */
+static int multi_socket_poller_flags(int ready_in, int ready_out, int failed, int what) {
+  int flags = 0;
+
+  if (ready_in) flags |= CURL_CSELECT_IN;
+  if (ready_out) flags |= CURL_CSELECT_OUT;
+  if (failed) flags |= multi_socket_cselect_flags_for_curl_poll(what);
+
+  return flags;
+}
+
+static void multi_socket_poller_act(ruby_curl_multi *rbcm, multi_socket_ctx *ctx, int fd, int ready_in, int ready_out, int failed, int *dispatched) {
+  st_data_t what;
+  int flags;
+  CURLMcode mrc;
+
+  /* An earlier action in this batch may have made libcurl drop the socket. */
+  if (!st_lookup(ctx->sock_map, (st_data_t)fd, &what)) return;
+
+  flags = multi_socket_poller_flags(ready_in, ready_out, failed, (int)what);
+  if (!flags) return;
+
+#if CURB_SOCKET_DEBUG
+  {
+    char b[32];
+    curb_debugf("[curb.socket] poller socket_action fd=%d flags=%s", fd, cselect_flags_str(flags, b, sizeof(b)));
+  }
+#endif
+  mrc = curl_multi_socket_action(rbcm->handle, (curl_socket_t)fd, flags, &rbcm->running);
+  if (mrc != CURLM_OK) raise_curl_multi_error_exception(mrc);
+  (*dispatched)++;
+}
+
+/* Collect pending poller events without blocking and hand each ready socket
+ * to libcurl. Returns the number of socket actions performed. */
+static int multi_socket_poller_dispatch(ruby_curl_multi *rbcm, multi_socket_ctx *ctx) {
+  int dispatched = 0;
+  int rounds = 0;
+  /* kqueue reports read and write readiness as separate events. */
+  int max_rounds = (int)((ctx->sock_map->num_entries * 2) / CURB_SOCKET_POLLER_BATCH) + 1;
+  int n, i;
+
+  do {
+#if defined(CURB_SOCKET_POLLER_EPOLL)
+    struct epoll_event events[CURB_SOCKET_POLLER_BATCH];
+    n = epoll_wait(ctx->poller_fd, events, CURB_SOCKET_POLLER_BATCH, 0);
+    if (n < 0) {
+      if (errno != EINTR) rb_sys_fail("epoll_wait");
+      n = 0;
     }
+    for (i = 0; i < n; i++) {
+      uint32_t ev = events[i].events;
+      multi_socket_poller_act(rbcm, ctx, events[i].data.fd,
+                              (ev & EPOLLIN) != 0, (ev & EPOLLOUT) != 0,
+                              (ev & (EPOLLERR | EPOLLHUP)) != 0, &dispatched);
+    }
+#else
+    struct kevent events[CURB_SOCKET_POLLER_BATCH];
+    struct timespec no_wait = {0, 0};
+    n = kevent(ctx->poller_fd, NULL, 0, events, CURB_SOCKET_POLLER_BATCH, &no_wait);
+    if (n < 0) {
+      if (errno != EINTR) rb_sys_fail("kevent");
+      n = 0;
+    }
+    for (i = 0; i < n; i++) {
+      if (events[i].flags & EV_ERROR) continue;
+      multi_socket_poller_act(rbcm, ctx, (int)events[i].ident,
+                              events[i].filter == EVFILT_READ, events[i].filter == EVFILT_WRITE,
+                              0, &dispatched);
+    }
+#endif
+  } while (n == CURB_SOCKET_POLLER_BATCH && ++rounds < max_rounds);
+
+  return dispatched;
+}
+
+/* Wait for any tracked socket through the scheduler's io_wait hook on the
+ * poller descriptor, then dispatch whatever became ready. */
+static int multi_socket_poller_wait(VALUE self, ruby_curl_multi *rbcm, multi_socket_ctx *ctx, VALUE scheduler, struct timeval *tv) {
+  VALUE io = multi_socket_poller_io(self, ctx);
+  double timeout_s = (double)tv->tv_sec + ((double)tv->tv_usec / 1e6);
+
+  /* The hook's return value varies across schedulers; the non-blocking
+   * dispatch below is the source of truth for what is ready. */
+  curb_fiber_scheduler_io_wait(scheduler, io, INT2NUM(RB_WAITFD_IN), rb_float_new(timeout_s));
+  return multi_socket_poller_dispatch(rbcm, ctx);
+}
+#endif
+
+#if defined(HAVE_RB_FIBER_SCHEDULER_IO_SELECT) && defined(HAVE_RB_FIBER_SCHEDULER_CURRENT)
+struct build_io_select_arrays_args {
+  multi_socket_ctx *ctx;
+  VALUE readables;
+  VALUE writables;
+  VALUE exceptables;
+  int failed;
+  int state;
+};
+
+static int build_io_select_arrays_i(st_data_t key, st_data_t val, st_data_t argp) {
+  struct build_io_select_arrays_args *a = (struct build_io_select_arrays_args *)argp;
+  int fd = (int)key;
+  int what = (int)val;
+  struct io_for_fd_args io_args = { a->ctx, fd, what };
+  int io_state = 0;
+  VALUE io;
+
+  if (!multi_socket_fd_valid_p(fd)) {
+    a->failed = 1;
+    return ST_STOP;
+  }
+
+  io = rb_protect(multi_socket_io_for_fd_protected, (VALUE)&io_args, &io_state);
+  if (io_state || NIL_P(io)) {
+    if (io_state) {
+      a->state = io_state;
+    }
+    a->failed = 1;
+    return ST_STOP;
+  }
+
+  if (what == CURL_POLL_IN || what == CURL_POLL_INOUT) rb_ary_push(a->readables, io);
+  if (what == CURL_POLL_OUT || what == CURL_POLL_INOUT) rb_ary_push(a->writables, io);
+  rb_ary_push(a->exceptables, io);
+
+  return ST_CONTINUE;
+}
+
+struct collect_io_select_ready_args {
+  multi_socket_ctx *ctx;
+  VALUE readables;
+  VALUE writables;
+  VALUE exceptables;
+  struct ready_fd *fds;
+  int capacity;
+  int count;
+};
+
+static int collect_io_select_ready_i(st_data_t key, st_data_t val, st_data_t argp) {
+  (void)val;
+  struct collect_io_select_ready_args *a = (struct collect_io_select_ready_args *)argp;
+  VALUE io = rb_hash_aref(a->ctx->io_cache, INT2NUM((int)key));
+  int flags = 0;
+
+  if (NIL_P(io)) return ST_CONTINUE;
+  if (RTEST(rb_ary_includes(a->readables, io))) flags |= CURL_CSELECT_IN;
+  if (RTEST(rb_ary_includes(a->writables, io))) flags |= CURL_CSELECT_OUT;
+  if (RTEST(rb_ary_includes(a->exceptables, io))) flags |= CURL_CSELECT_ERR;
+
+  if (flags && a->count < a->capacity) {
+    a->fds[a->count].fd = (int)key;
+    a->fds[a->count].flags = flags;
+    a->count++;
+  }
+
+  return ST_CONTINUE;
+}
+#endif
+
+static void rb_curl_multi_socket_drive(VALUE self, ruby_curl_multi *rbcm, multi_socket_ctx *ctx, VALUE block) {
+  CURLMcode mrc;
+
+  do {
+    /* Prime the state: let libcurl act on timeouts to set up sockets. */
+    mrc = curl_multi_socket_action(rbcm->handle, CURL_SOCKET_TIMEOUT, 0, &rbcm->running);
+    if (mrc != CURLM_OK) raise_curl_multi_error_exception(mrc);
+    curb_debugf("[curb.socket] drive: initial socket_action timeout -> mrc=%d running=%d", mrc, rbcm->running);
+    rb_curl_multi_read_info(self, rbcm->handle);
+    rb_curl_multi_yield_if_given(self, block);
+
+    while (rbcm->running) {
+    struct timeval tv = {0, 0};
+    long wait_ms = curb_multi_default_timeout();
+
+    if (multi_socket_timer_due(ctx)) {
+      ctx->timeout_deadline_ms = -1;
+      mrc = curl_multi_socket_action(rbcm->handle, CURL_SOCKET_TIMEOUT, 0, &rbcm->running);
+      curb_debugf("[curb.socket] socket_action timeout(due) -> mrc=%d running=%d", mrc, rbcm->running);
+      if (mrc != CURLM_OK) raise_curl_multi_error_exception(mrc);
+      rb_curl_multi_read_info(self, rbcm->handle);
+      rb_curl_multi_yield_if_given(self, block);
+      if (rbcm->running && multi_socket_timer_due(ctx)) {
+        /* A repeatedly rearmed 0ms timer must still let sibling fibers run. */
+        curb_multi_scheduler_yield();
+      }
+      continue;
+    }
+
+    if (ctx->timeout_deadline_ms >= 0) {
+      long long remaining_ms = ctx->timeout_deadline_ms - multi_socket_current_time_ms();
+      if (remaining_ms < wait_ms) wait_ms = remaining_ms < 0 ? 0 : (long)remaining_ms;
+    }
+    tv.tv_sec = wait_ms / 1000;
+    tv.tv_usec = (wait_ms % 1000) * 1000;
 
     /* Find a representative fd to wait on (if any). */
     int wait_fd = -1;
@@ -1224,102 +1831,210 @@ static void rb_curl_multi_socket_drive(VALUE self, ruby_curl_multi *rbcm, multi_
       if (st.found) { wait_fd = st.fd; wait_what = st.what; }
     }
 
-    /* Count tracked fds for logging */
-    int count_tracked = 0;
-    if (ctx->sock_map) {
-      struct counter_state cs = { 0 };
-      st_foreach(ctx->sock_map, st_count_i, (st_data_t)&cs);
-      count_tracked = cs.count;
-    }
+    int count_tracked = ctx->sock_map ? (int)ctx->sock_map->num_entries : 0;
 
     curb_debugf("[curb.socket] wait phase: tracked_fds=%d fd=%d what=%d tv=%ld.%06ld", count_tracked, wait_fd, wait_what, (long)tv.tv_sec, (long)tv.tv_usec);
 
     int did_timeout = 0;
     int any_ready = 0;
+    int ready_flags = 0;
 
-    int handled_wait = 0;
-    if (count_tracked > 1) {
-      /* Multi-fd wait using scheduler-aware rb_thread_fd_select. */
-      rb_fdset_t rfds, wfds, efds;
-      rb_fd_init(&rfds); rb_fd_init(&wfds); rb_fd_init(&efds);
-      int maxfd = -1;
-      rb_fdset_from_sockmap(ctx->sock_map, &rfds, &wfds, &efds, &maxfd);
-      int rc = rb_thread_fd_select(maxfd + 1, &rfds, &wfds, &efds, &tv);
-      curb_debugf("[curb.socket] rb_thread_fd_select(multi) rc=%d maxfd=%d", rc, maxfd);
-      if (rc < 0) {
-        rb_fd_term(&rfds); rb_fd_term(&wfds); rb_fd_term(&efds);
-        if (errno != EINTR) rb_raise(rb_eRuntimeError, "select(): %s", strerror(errno));
-        continue;
-      }
-      any_ready = (rc > 0);
-      did_timeout = (rc == 0);
-      if (any_ready) {
-        struct dispatch_args d; d.mh = rbcm->handle; d.running = &rbcm->running; d.mrc = CURLM_OK; d.r = &rfds; d.w = &wfds; d.e = &efds;
-        st_foreach(ctx->sock_map, dispatch_ready_fd_i, (st_data_t)&d);
-        if (d.mrc != CURLM_OK) {
-          rb_fd_term(&rfds); rb_fd_term(&wfds); rb_fd_term(&efds);
-          raise_curl_multi_error_exception(d.mrc);
-        }
-      }
-      rb_fd_term(&rfds); rb_fd_term(&wfds); rb_fd_term(&efds);
-      handled_wait = 1;
-    } else if (count_tracked == 1) {
-#if defined(HAVE_RB_FIBER_SCHEDULER_IO_WAIT) && defined(HAVE_RB_FIBER_SCHEDULER_CURRENT)
+	    int handled_wait = 0;
+#ifdef CURB_SOCKET_POLLER
+	    if (count_tracked > 0 && ctx->poller_fd >= 0) {
+	      VALUE scheduler = curb_fiber_scheduler_current();
+	      if (scheduler != Qnil) {
+	        /* Ready sockets are dispatched inside, so any_ready stays 0 and
+	         * the single-fd dispatch below is skipped. */
+	        int dispatched = multi_socket_poller_wait(self, rbcm, ctx, scheduler, &tv);
+	        curb_debugf("[curb.socket] poller wait dispatched=%d", dispatched);
+	        did_timeout = !dispatched && multi_socket_timer_due(ctx);
+	        handled_wait = 1;
+	      }
+	    }
+#endif
+	    if (handled_wait) {
+	      /* The poller already waited and dispatched. */
+	    } else if (count_tracked > 1) {
+#if defined(HAVE_RB_FIBER_SCHEDULER_IO_SELECT) && defined(HAVE_RB_FIBER_SCHEDULER_CURRENT)
+	      {
+	        VALUE scheduler = curb_fiber_scheduler_current();
+	        if (scheduler != Qnil) {
+	          VALUE readables = rb_ary_new();
+	          VALUE writables = rb_ary_new();
+	          VALUE exceptables = rb_ary_new();
+	          struct build_io_select_arrays_args build_args = { ctx, readables, writables, exceptables, 0, 0 };
+	          st_foreach(ctx->sock_map, build_io_select_arrays_i, (st_data_t)&build_args);
+	          if (build_args.state) rb_jump_tag(build_args.state);
+	          if (!build_args.failed) {
+	            double timeout_s = (double)tv.tv_sec + ((double)tv.tv_usec / 1e6);
+	            VALUE timeout = rb_float_new(timeout_s);
+	            VALUE ready = rb_fiber_scheduler_io_select(scheduler, readables, writables, exceptables, timeout);
+	            if (UNDEF_P(ready)) {
+	              /* The scheduler does not implement the optional io_select hook:
+	               * rb_fiber_scheduler_io_select returns Qundef immediately.
+	               * Leave handled_wait unset so the io_wait fallback below can
+	               * perform a cooperative wait. */
+	              curb_debugf("[curb.socket] scheduler io_select not implemented; falling back to io_wait");
+	            } else {
+	              handled_wait = 1;
+	              any_ready = RB_TYPE_P(ready, T_ARRAY);
+	              did_timeout = !any_ready && multi_socket_timer_due(ctx);
+	              if (any_ready) {
+	                VALUE ready_readables = rb_ary_entry(ready, 0);
+	                VALUE ready_writables = rb_ary_entry(ready, 1);
+	                VALUE ready_exceptables = rb_ary_entry(ready, 2);
+	                struct ready_fd *ready_fds = ALLOC_N(struct ready_fd, count_tracked);
+	                struct collect_io_select_ready_args d;
+	                int i;
+	                if (!RB_TYPE_P(ready_readables, T_ARRAY)) ready_readables = rb_ary_new();
+	                if (!RB_TYPE_P(ready_writables, T_ARRAY)) ready_writables = rb_ary_new();
+	                if (!RB_TYPE_P(ready_exceptables, T_ARRAY)) ready_exceptables = rb_ary_new();
+	                d.ctx = ctx;
+	                d.readables = ready_readables;
+	                d.writables = ready_writables;
+	                d.exceptables = ready_exceptables;
+	                d.fds = ready_fds;
+	                d.capacity = count_tracked;
+	                d.count = 0;
+	                st_foreach(ctx->sock_map, collect_io_select_ready_i, (st_data_t)&d);
+	                any_ready = (d.count > 0);
+	                did_timeout = !any_ready && multi_socket_timer_due(ctx);
+	                for (i = 0; i < d.count; i++) {
+	                  mrc = curl_multi_socket_action(rbcm->handle, (curl_socket_t)d.fds[i].fd, d.fds[i].flags, &rbcm->running);
+	                  if (mrc != CURLM_OK) {
+	                    xfree(ready_fds);
+	                    raise_curl_multi_error_exception(mrc);
+	                  }
+	                }
+	                xfree(ready_fds);
+	              }
+	            }
+	          }
+	        }
+	      }
+#endif
+	      /* Ruby versions without the public io_select C API, and newer
+	       * schedulers that omit the optional hook, wait cooperatively on one
+	       * representative descriptor, then use a zero-time select below to
+	       * collect readiness across the whole set. */
+	      if (!handled_wait && wait_fd >= 0) {
+	        VALUE scheduler = curb_fiber_scheduler_current();
+	        if (scheduler != Qnil) {
+	          if (!multi_socket_fd_valid_p(wait_fd)) {
+	            multi_socket_forget_fd(ctx, wait_fd);
+	            did_timeout = 1;
+	            handled_wait = 1;
+	          } else {
+	            struct io_for_fd_args io_args = { ctx, wait_fd, wait_what };
+	            int io_state = 0;
+	            VALUE io = rb_protect(multi_socket_io_for_fd_protected, (VALUE)&io_args, &io_state);
+	            if (io_state) rb_jump_tag(io_state);
+	            if (!NIL_P(io)) {
+	              int events = multi_socket_wait_events_for_curl_poll(wait_what);
+	              double timeout_s = (double)tv.tv_sec + ((double)tv.tv_usec / 1e6);
+	              curb_fiber_scheduler_io_wait(scheduler, io, INT2NUM(events), rb_float_new(timeout_s));
+	              tv.tv_sec = 0;
+	              tv.tv_usec = 0;
+	            }
+	          }
+	        }
+	      }
+	      if (!handled_wait) {
+	        /* Multi-fd select. After the scheduler io_wait fallback above, tv is
+	         * zero and this only polls the complete descriptor set. Without a
+	         * scheduler it performs the normal GVL-releasing wait. */
+	        rb_fdset_t rfds, wfds, efds;
+	        rb_fd_init(&rfds); rb_fd_init(&wfds); rb_fd_init(&efds);
+	        int maxfd = -1;
+	        rb_fdset_from_sockmap(ctx->sock_map, &rfds, &wfds, &efds, &maxfd);
+	        int rc = rb_thread_fd_select(maxfd + 1, &rfds, &wfds, &efds, &tv);
+	        curb_debugf("[curb.socket] rb_thread_fd_select(multi) rc=%d maxfd=%d", rc, maxfd);
+	        if (rc < 0) {
+	          rb_fd_term(&rfds); rb_fd_term(&wfds); rb_fd_term(&efds);
+	          if (errno != EINTR) rb_raise(rb_eRuntimeError, "select(): %s", strerror(errno));
+	          continue;
+	        }
+	        any_ready = (rc > 0);
+	        did_timeout = (rc == 0 && multi_socket_timer_due(ctx));
+	        if (any_ready) {
+	          struct ready_fd *ready_fds = ALLOC_N(struct ready_fd, count_tracked);
+	          struct collect_ready_fd_args d;
+	          int i;
+	          d.r = &rfds;
+	          d.w = &wfds;
+	          d.e = &efds;
+	          d.fds = ready_fds;
+	          d.capacity = count_tracked;
+	          d.count = 0;
+	          st_foreach(ctx->sock_map, collect_ready_fd_i, (st_data_t)&d);
+	          for (i = 0; i < d.count; i++) {
+	            mrc = curl_multi_socket_action(rbcm->handle, (curl_socket_t)d.fds[i].fd, d.fds[i].flags, &rbcm->running);
+	            if (mrc != CURLM_OK) {
+	              xfree(ready_fds);
+	              rb_fd_term(&rfds); rb_fd_term(&wfds); rb_fd_term(&efds);
+	              raise_curl_multi_error_exception(mrc);
+	            }
+	          }
+	          xfree(ready_fds);
+	        }
+	        rb_fd_term(&rfds); rb_fd_term(&wfds); rb_fd_term(&efds);
+	        handled_wait = 1;
+	      }
+	    } else if (count_tracked == 1) {
       {
-        VALUE scheduler = rb_fiber_scheduler_current();
+        VALUE scheduler = curb_fiber_scheduler_current();
         if (scheduler != Qnil) {
+          int scheduler_wait_handled = 0;
           int events = 0;
           if (wait_fd >= 0) {
-            if (wait_what == CURL_POLL_IN) events = RB_WAITFD_IN;
-            else if (wait_what == CURL_POLL_OUT) events = RB_WAITFD_OUT;
-            else if (wait_what == CURL_POLL_INOUT) events = RB_WAITFD_IN|RB_WAITFD_OUT;
-            else events = RB_WAITFD_IN|RB_WAITFD_OUT;
+            events = multi_socket_wait_events_for_curl_poll(wait_what);
           }
           double timeout_s = (double)tv.tv_sec + ((double)tv.tv_usec / 1e6);
           VALUE timeout = rb_float_new(timeout_s);
           if (wait_fd < 0) {
-#ifdef HAVE_RB_THREAD_FD_SELECT
-            rb_thread_fd_select(0, NULL, NULL, NULL, &tv);
-#else
-            rb_thread_wait_for(tv);
-#endif
-            did_timeout = 1;
+            /* No pollable fd yet: sleep via the scheduler's kernel_sleep so
+             * sibling fibers keep running while libcurl gets ready. */
+            curb_multi_scheduler_sleep(&tv);
+            did_timeout = multi_socket_timer_due(ctx);
+            scheduler_wait_handled = 1;
           } else if (!multi_socket_fd_valid_p(wait_fd)) {
             multi_socket_forget_fd(ctx, wait_fd);
             did_timeout = 1;
+            scheduler_wait_handled = 1;
           } else {
-            struct io_for_fd_args io_args = { ctx, wait_fd };
+            struct io_for_fd_args io_args = { ctx, wait_fd, wait_what };
             int io_state = 0;
             VALUE io = rb_protect(multi_socket_io_for_fd_protected, (VALUE)&io_args, &io_state);
-            if (io_state || NIL_P(io)) {
-              if (io_state) rb_set_errinfo(Qnil);
-              multi_socket_forget_fd(ctx, wait_fd);
-              did_timeout = 1;
+            if (io_state) rb_jump_tag(io_state);
+            if (NIL_P(io)) {
               any_ready = 0;
             } else {
-              struct fiber_io_wait_args args = { scheduler, io, INT2NUM(events), timeout };
-              int state = 0;
-              VALUE ready = rb_protect(fiber_io_wait_protected, (VALUE)&args, &state);
-              if (state) {
-                rb_set_errinfo(Qnil);
-                did_timeout = 1;
-                any_ready = 0;
-              } else {
-                any_ready = (ready != Qfalse);
-                did_timeout = !any_ready;
+              VALUE ready = curb_fiber_scheduler_io_wait(scheduler, io, INT2NUM(events), timeout);
+              scheduler_wait_handled = 1;
+              any_ready = (ready != Qfalse && !NIL_P(ready));
+              did_timeout = !any_ready && multi_socket_timer_due(ctx);
+              if (any_ready) {
+                if (ready == Qtrue) {
+                  ready_flags = multi_socket_cselect_flags_for_curl_poll(wait_what);
+                } else if (CURB_INTEGER_P(ready)) {
+                  ready_flags = multi_socket_cselect_flags_for_wait_events(NUM2INT(ready));
+                  if (ready_flags == 0) {
+                    any_ready = 0;
+                    did_timeout = multi_socket_timer_due(ctx);
+                  }
+                } else {
+                  ready_flags = multi_socket_cselect_flags_for_curl_poll(wait_what);
+                }
               }
             }
           }
-          handled_wait = 1;
+          if (scheduler_wait_handled) handled_wait = 1;
         }
       }
-#endif
 #if defined(HAVE_RB_WAIT_FOR_SINGLE_FD)
       if (!handled_wait && wait_fd >= 0) {
-        int ev = 0;
-        if (wait_what == CURL_POLL_IN) ev = RB_WAITFD_IN;
-        else if (wait_what == CURL_POLL_OUT) ev = RB_WAITFD_OUT;
-        else if (wait_what == CURL_POLL_INOUT) ev = RB_WAITFD_IN|RB_WAITFD_OUT;
+        int ev = multi_socket_wait_events_for_curl_poll(wait_what);
         int rc = rb_wait_for_single_fd(wait_fd, ev, &tv);
         curb_debugf("[curb.socket] rb_wait_for_single_fd rc=%d fd=%d ev=%d", rc, wait_fd, ev);
         if (rc < 0) {
@@ -1327,7 +2042,8 @@ static void rb_curl_multi_socket_drive(VALUE self, ruby_curl_multi *rbcm, multi_
           continue;
         }
         any_ready = (rc != 0);
-        did_timeout = (rc == 0);
+        did_timeout = (rc == 0 && multi_socket_timer_due(ctx));
+        if (any_ready) ready_flags = multi_socket_cselect_flags_for_wait_events(rc);
         handled_wait = 1;
       }
 #endif
@@ -1350,28 +2066,34 @@ static void rb_curl_multi_socket_drive(VALUE self, ruby_curl_multi *rbcm, multi_
           continue;
         }
         any_ready = (rc > 0);
-        did_timeout = (rc == 0);
+        did_timeout = (rc == 0 && multi_socket_timer_due(ctx));
+        if (any_ready && wait_fd >= 0) {
+          if (rb_fd_isset(wait_fd, &rfds)) ready_flags |= CURL_CSELECT_IN;
+          if (rb_fd_isset(wait_fd, &wfds)) ready_flags |= CURL_CSELECT_OUT;
+          if (rb_fd_isset(wait_fd, &efds)) ready_flags |= CURL_CSELECT_ERR;
+        }
         rb_fd_term(&rfds); rb_fd_term(&wfds); rb_fd_term(&efds);
       }
     } else { /* count_tracked == 0 */
-#ifdef HAVE_RB_THREAD_FD_SELECT
-      rb_thread_fd_select(0, NULL, NULL, NULL, &tv);
-#else
-      rb_thread_wait_for(tv);
-#endif
+      /* No sockets exposed yet (e.g. libcurl's threaded resolver doing DNS):
+       * sleep via the scheduler's kernel_sleep when one is active so sibling
+       * fibers keep running, otherwise a plain thread wait. */
+      curb_multi_scheduler_sleep(&tv);
+      /* libcurl can report active work without a socket callback or deadline;
+       * drive the timeout socket after the sleep so the state machine does
+       * not stall indefinitely. */
       did_timeout = 1;
     }
 
     if (did_timeout) {
+      ctx->timeout_deadline_ms = -1;
       mrc = curl_multi_socket_action(rbcm->handle, CURL_SOCKET_TIMEOUT, 0, &rbcm->running);
       curb_debugf("[curb.socket] socket_action timeout -> mrc=%d running=%d", mrc, rbcm->running);
       if (mrc != CURLM_OK) raise_curl_multi_error_exception(mrc);
     } else if (any_ready) {
       if (count_tracked == 1 && wait_fd >= 0) {
-        int flags = 0;
-        if (wait_what == CURL_POLL_IN || wait_what == CURL_POLL_INOUT) flags |= CURL_CSELECT_IN;
-        if (wait_what == CURL_POLL_OUT || wait_what == CURL_POLL_INOUT) flags |= CURL_CSELECT_OUT;
-        flags |= CURL_CSELECT_ERR;
+        int flags = ready_flags;
+        if (flags == 0) flags = multi_socket_cselect_flags_for_curl_poll(wait_what);
 #if CURB_SOCKET_DEBUG
         {
           char b[32];
@@ -1387,7 +2109,13 @@ static void rb_curl_multi_socket_drive(VALUE self, ruby_curl_multi *rbcm, multi_
     rb_curl_multi_read_info(self, rbcm->handle);
     curb_debugf("[curb.socket] processed completions; running=%d", rbcm->running);
     rb_curl_multi_yield_if_given(self, block);
-  }
+    }
+
+    /* Match the legacy perform contract: the block gets a final idle yield,
+     * and work queued from that yield is driven before perform returns. */
+    rb_curl_multi_read_info(self, rbcm->handle);
+    rb_curl_multi_yield_if_given(self, block);
+  } while (rbcm->running);
 }
 
 struct socket_drive_args { VALUE self; ruby_curl_multi *rbcm; multi_socket_ctx *ctx; VALUE block; };
@@ -1396,7 +2124,10 @@ static VALUE ruby_curl_multi_socket_drive_body(VALUE argp) {
   rb_curl_multi_socket_drive(a->self, a->rbcm, a->ctx, a->block);
   return Qtrue;
 }
-struct socket_cleanup_args { ruby_curl_multi *rbcm; multi_socket_ctx *ctx; };
+struct socket_cleanup_args { VALUE self; ruby_curl_multi *rbcm; multi_socket_ctx *ctx; };
+static VALUE multi_socket_close_io(VALUE io) {
+  return rb_funcall(io, rb_intern("close"), 0);
+}
 static VALUE ruby_curl_multi_socket_drive_ensure(VALUE argp) {
   struct socket_cleanup_args *c = (struct socket_cleanup_args *)argp;
   if (c->rbcm && c->rbcm->handle) {
@@ -1410,12 +2141,35 @@ static VALUE ruby_curl_multi_socket_drive_ensure(VALUE argp) {
     c->ctx->sock_map = NULL;
   }
   if (c->ctx) {
+    if (!NIL_P(c->ctx->io_cache)) {
+      rb_hash_clear(c->ctx->io_cache);
+    }
     c->ctx->io_cache = Qnil;
+    if (!NIL_P(c->ctx->poller_io)) {
+      /* Let Ruby and the scheduler drop the wrapper before the descriptor
+       * goes away. autoclose is off, so this leaves poller_fd open. Keep any
+       * exception already propagating out of the drive loop. */
+      VALUE errinfo = rb_errinfo();
+      int state = 0;
+      rb_protect(multi_socket_close_io, c->ctx->poller_io, &state);
+      rb_set_errinfo(errinfo);
+      c->ctx->poller_io = Qnil;
+    }
+    if (c->ctx->poller_fd >= 0) {
+      close(c->ctx->poller_fd);
+      c->ctx->poller_fd = -1;
+    }
+  }
+  if (!NIL_P(c->self) && rb_ivar_defined(c->self, id_socket_io_cache_ivar)) {
+    rb_funcall(c->self, rb_intern("remove_instance_variable"), 1, ID2SYM(id_socket_io_cache_ivar));
+  }
+  if (!NIL_P(c->self) && rb_ivar_defined(c->self, id_socket_poller_io_ivar)) {
+    rb_funcall(c->self, rb_intern("remove_instance_variable"), 1, ID2SYM(id_socket_poller_io_ivar));
   }
   return Qnil;
 }
 
-VALUE ruby_curl_multi_socket_perform(int argc, VALUE *argv, VALUE self) {
+static VALUE ruby_curl_multi_socket_perform_impl(int argc, VALUE *argv, VALUE self) {
   ruby_curl_multi *rbcm;
   VALUE block = Qnil;
   rb_scan_args(argc, argv, "0&", &block);
@@ -1428,8 +2182,19 @@ VALUE ruby_curl_multi_socket_perform(int argc, VALUE *argv, VALUE self) {
 
   multi_socket_ctx ctx;
   ctx.sock_map = st_init_numtable();
-  ctx.timeout_ms = -1;
+  ctx.timeout_deadline_ms = -1;
   ctx.io_cache = rb_hash_new();
+  ctx.poller_fd = -1;
+  ctx.poller_io = Qnil;
+  rb_ivar_set(self, id_socket_io_cache_ivar, ctx.io_cache);
+#ifdef CURB_SOCKET_POLLER
+  /* Only fiber-scheduler waits use the poller; thread-level waits keep using
+   * rb_thread_fd_select. If it cannot be created the loop falls back to the
+   * io_select/io_wait paths. */
+  if (curb_fiber_scheduler_current() != Qnil) {
+    ctx.poller_fd = multi_socket_poller_create();
+  }
+#endif
 
   /* install socket/timer callbacks */
   curl_multi_setopt(rbcm->handle, CURLMOPT_SOCKETFUNCTION, multi_socket_cb);
@@ -1439,13 +2204,15 @@ VALUE ruby_curl_multi_socket_perform(int argc, VALUE *argv, VALUE self) {
 
   /* run using socket action loop with ensure-cleanup */
   struct socket_drive_args body_args = { self, rbcm, &ctx, block };
-  struct socket_cleanup_args ensure_args = { rbcm, &ctx };
+  struct socket_cleanup_args ensure_args = { self, rbcm, &ctx };
   rb_ensure(ruby_curl_multi_socket_drive_body, (VALUE)&body_args, ruby_curl_multi_socket_drive_ensure, (VALUE)&ensure_args);
 
   /* finalize */
-  rb_curl_multi_read_info(self, rbcm->handle);
-  rb_curl_multi_yield_if_given(self, block);
-  if (cCurlMutiAutoClose == 1) rb_funcall(self, rb_intern("_autoclose"), 0);
+  if (curb_multi_autoclose_enabled()) {
+    rbcm->allow_close_during_perform = 1;
+    rb_funcall(self, rb_intern("_autoclose"), 0);
+    rbcm->allow_close_during_perform = 0;
+  }
 
   return Qtrue;
 }
@@ -1493,6 +2260,14 @@ static VALUE curb_select(void *args) {
   int rc = select(set->maxfd, set->fdread, set->fdwrite, set->fdexcep, set->tv);
   return INT2FIX(rc);
 }
+
+#ifdef HAVE_RB_THREAD_CALL_WITHOUT_GVL
+static void *curb_select_without_gvl(void *args) {
+  struct _select_set* set = args;
+  int rc = select(set->maxfd, set->fdread, set->fdwrite, set->fdexcep, set->tv);
+  return (void *)(intptr_t)rc;
+}
+#endif
 #endif
 
 /*
@@ -1510,20 +2285,22 @@ static VALUE curb_select(void *args) {
  *
  * Run multi handles, looping selecting when data can be transfered
  */
-VALUE ruby_curl_multi_perform(int argc, VALUE *argv, VALUE self) {
+static VALUE ruby_curl_multi_perform_impl(int argc, VALUE *argv, VALUE self) {
   CURLMcode mcode;
   ruby_curl_multi *rbcm;
+  long timeout_milliseconds;
+  VALUE block = Qnil;
+#ifndef CURB_USE_MULTI_POLL
   int maxfd, rc = -1;
   fd_set fdread, fdwrite, fdexcep;
 #ifdef _WIN32
   fd_set crt_fdread, crt_fdwrite, crt_fdexcep;
 #endif
-  long timeout_milliseconds;
   struct timeval tv = {0, 0};
   struct timeval tv_100ms = {0, 100000};
-  VALUE block = Qnil;
 #if !defined(HAVE_RB_THREAD_FD_SELECT) && (defined(HAVE_RB_THREAD_BLOCKING_REGION) || defined(HAVE_RB_THREAD_CALL_WITHOUT_GVL))
   struct _select_set fdset_args;
+#endif
 #endif
 
   rb_scan_args(argc, argv, "0&", &block);
@@ -1534,7 +2311,7 @@ VALUE ruby_curl_multi_perform(int argc, VALUE *argv, VALUE self) {
     clear_multi_deferred_exception_source_id_if_any(self);
   }
 
-  timeout_milliseconds = cCurlMutiDefaulttimeout;
+  timeout_milliseconds = curb_multi_default_timeout();
 
   // Run curl_multi_perform for the first time to get the ball rolling
   rb_curl_multi_run( self, rbcm->handle, &(rbcm->running) );
@@ -1568,31 +2345,53 @@ VALUE ruby_curl_multi_perform(int argc, VALUE *argv, VALUE self) {
         rb_curl_multi_run( self, rbcm->handle, &(rbcm->running) );
         rb_curl_multi_read_info( self, rbcm->handle );
         rb_curl_multi_yield_if_given(self, block);
-#if defined(HAVE_RB_FIBER_SCHEDULER_CURRENT)
-        if (rb_fiber_scheduler_current() != Qnil) {
-          rb_thread_schedule();
-        }
-#endif
+        /* Yield the fiber so repeated immediate curl timeouts cannot starve
+         * sibling work on this thread. */
+        curb_multi_scheduler_yield();
         continue;
       }
 
-      if (timeout_milliseconds < 0 || timeout_milliseconds > cCurlMutiDefaulttimeout) {
-        timeout_milliseconds = cCurlMutiDefaulttimeout; /* libcurl doesn't know how long to wait, use a default timeout */
+      if (timeout_milliseconds < 0 || timeout_milliseconds > curb_multi_default_timeout()) {
+        timeout_milliseconds = curb_multi_default_timeout(); /* libcurl doesn't know how long to wait, use a default timeout */
                                                         /* or buggy versions libcurl sometimes reports huge timeouts... let's cap it */
       }
 
-#if defined(HAVE_CURL_MULTI_WAIT) && !defined(HAVE_RB_THREAD_FD_SELECT)
+#if defined(CURB_USE_MULTI_POLL)
+      {
+        struct multi_poll_args poll_args;
+        poll_args.handle     = rbcm->handle;
+        poll_args.timeout_ms = timeout_milliseconds > INT_MAX ? INT_MAX : (int)timeout_milliseconds;
+        poll_args.numfds     = 0;
+        poll_args.code       = CURLM_OK;
+        /*
+         * Wait with the GVL released. curl_multi_poll sleeps for the full
+         * timeout even when libcurl has no sockets to watch, so no separate
+         * idle sleep is needed. Pending interrupts are checked when
+         * rb_thread_call_without_gvl returns. Like rb_thread_fd_select, this
+         * wait does not consult the fiber scheduler; perform routes to the
+         * socket-action loop when a scheduler is active.
+         */
+        rb_thread_call_without_gvl(curb_multi_poll_without_gvl, &poll_args,
+                                   curb_multi_poll_ubf, rbcm->handle);
+        if (poll_args.code != CURLM_OK) {
+          raise_curl_multi_error_exception(poll_args.code);
+        }
+        rb_curl_multi_run(self, rbcm->handle, &(rbcm->running));
+        rb_curl_multi_read_info(self, rbcm->handle);
+        rb_curl_multi_yield_if_given(self, block);
+      }
+#elif defined(HAVE_CURL_MULTI_WAIT) && !defined(HAVE_RB_THREAD_FD_SELECT)
       {
         struct wait_args wait_args;
         wait_args.handle     = rbcm->handle;
         wait_args.timeout_ms = timeout_milliseconds;
         wait_args.numfds     = 0;
         /*
-         * When a Fiber scheduler is available (Ruby >= 3.x), rb_thread_fd_select
-         * integrates with it. If we have rb_thread_fd_select available at build
-         * time, we avoid curl_multi_wait entirely (see preprocessor guard above)
-         * and use the fdset branch below. Otherwise, we use curl_multi_wait and
-         * release the GVL so Ruby threads can continue to run.
+         * Wait via curl_multi_wait with the GVL released so other Ruby
+         * threads can continue to run. Like rb_thread_fd_select, this wait
+         * does not consult the fiber scheduler; scheduler-aware waiting is
+         * provided by the socket-action loop, which perform routes to when a
+         * scheduler is active (see ruby_curl_multi_perform).
          */
         CURLMcode wait_rc;
 #if defined(HAVE_RB_THREAD_CALL_WITHOUT_GVL)
@@ -1606,13 +2405,7 @@ VALUE ruby_curl_multi_perform(int argc, VALUE *argv, VALUE self) {
           raise_curl_multi_error_exception(wait_rc);
         }
         if (wait_args.numfds == 0) {
-#ifdef HAVE_RB_THREAD_FD_SELECT
-          struct timeval tv_sleep = tv_100ms;
-          /* Sleep in a scheduler-aware way. */
-          rb_thread_fd_select(0, NULL, NULL, NULL, &tv_sleep);
-#else
-          rb_thread_wait_for(tv_100ms);
-#endif
+          curb_multi_scheduler_sleep(&tv_100ms);
         }
         /* Process pending transfers after waiting */
         rb_curl_multi_run(self, rbcm->handle, &(rbcm->running));
@@ -1621,8 +2414,10 @@ VALUE ruby_curl_multi_perform(int argc, VALUE *argv, VALUE self) {
       }
 #else
 
-      tv.tv_sec  = 0; /* never wait longer than 1 second */
-      tv.tv_usec = (int)(timeout_milliseconds * 1000); /* XXX: int is the right type for OSX, what about linux? */
+      /* Split into seconds and microseconds: a raw select() rejects a
+       * tv_usec of 1000000 or more, which default_timeout > 1000 produced. */
+      tv.tv_sec  = timeout_milliseconds / 1000;
+      tv.tv_usec = (timeout_milliseconds % 1000) * 1000;
 
       FD_ZERO(&fdread);
       FD_ZERO(&fdwrite);
@@ -1636,12 +2431,7 @@ VALUE ruby_curl_multi_perform(int argc, VALUE *argv, VALUE self) {
 
       if (maxfd == -1) {
         /* libcurl recommends sleeping for 100ms */
-#ifdef HAVE_RB_THREAD_FD_SELECT
-        struct timeval tv_sleep = tv_100ms;
-        rb_thread_fd_select(0, NULL, NULL, NULL, &tv_sleep);
-#else
-        rb_thread_wait_for(tv_100ms);
-#endif
+        curb_multi_scheduler_sleep(&tv_100ms);
         rb_curl_multi_run( self, rbcm->handle, &(rbcm->running) );
         rb_curl_multi_read_info( self, rbcm->handle );
         rb_curl_multi_yield_if_given(self, block);
@@ -1664,7 +2454,10 @@ VALUE ruby_curl_multi_perform(int argc, VALUE *argv, VALUE self) {
 #endif
 
 #ifdef HAVE_RB_THREAD_FD_SELECT
-      /* Prefer scheduler-aware waiting when available. Build rb_fdset_t sets. */
+      /* Wait with the GVL released. Note rb_thread_fd_select does not consult
+       * the fiber scheduler — under a scheduler, perform routes to the
+       * socket-action loop instead (see ruby_curl_multi_perform). Build
+       * rb_fdset_t sets. */
       {
         rb_fdset_t rfds, wfds, efds;
         rb_fd_init(&rfds);
@@ -1691,7 +2484,7 @@ VALUE ruby_curl_multi_perform(int argc, VALUE *argv, VALUE self) {
         rb_fd_term(&efds);
       }
 #elif defined(HAVE_RB_THREAD_CALL_WITHOUT_GVL)
-      rc = (int)(VALUE) rb_thread_call_without_gvl((void *(*)(void *))curb_select, &fdset_args, RUBY_UBF_IO, 0);
+      rc = (int)(intptr_t) rb_thread_call_without_gvl(curb_select_without_gvl, &fdset_args, RUBY_UBF_IO, 0);
 #elif HAVE_RB_THREAD_BLOCKING_REGION
       rc = rb_thread_blocking_region(curb_select, &fdset_args, RUBY_UBF_IO, 0);
 #else
@@ -1720,12 +2513,14 @@ VALUE ruby_curl_multi_perform(int argc, VALUE *argv, VALUE self) {
 #endif /* disabled curl_multi_wait: use fdsets */
     }
 
+    rb_curl_multi_read_info( self, rbcm->handle );
+    rb_curl_multi_yield_if_given(self, block);
   } while( rbcm->running );
 
-  rb_curl_multi_read_info( self, rbcm->handle );
-  rb_curl_multi_yield_if_given(self, block);
-  if (cCurlMutiAutoClose  == 1) {
+  if (curb_multi_autoclose_enabled()) {
+    rbcm->allow_close_during_perform = 1;
     rb_funcall(self, rb_intern("_autoclose"), 0);
+    rbcm->allow_close_during_perform = 0;
   }
   return Qtrue;
 }
@@ -1810,7 +2605,7 @@ static VALUE ruby_curl_multi_fdset(VALUE self) {
  *
  * Raises Curl::Err::MultiError on libcurl failure.
  */
-static VALUE ruby_curl_multi_perform_step(int argc, VALUE *argv, VALUE self) {
+static VALUE ruby_curl_multi_perform_step_impl(int argc, VALUE *argv, VALUE self) {
   ruby_curl_multi *rbcm;
   VALUE block;
   long timeout_ms = -1;
@@ -1825,11 +2620,102 @@ static VALUE ruby_curl_multi_perform_step(int argc, VALUE *argv, VALUE self) {
   }
   curl_multi_timeout(rbcm->handle, &timeout_ms);
 
-  if (cCurlMutiAutoClose == 1 && rbcm->running == 0) {
+  if (curb_multi_autoclose_enabled() && rbcm->running == 0) {
+    rbcm->allow_close_during_perform = 1;
     rb_funcall(self, rb_intern("_autoclose"), 0);
+    rbcm->allow_close_during_perform = 0;
   }
 
   return rb_ary_new3(2, INT2FIX(rbcm->running), LONG2NUM(timeout_ms));
+}
+
+struct multi_perform_call_args {
+  int argc;
+  VALUE *argv;
+  VALUE self;
+  VALUE result;
+  VALUE (*func)(int, VALUE *, VALUE);
+};
+
+static VALUE ruby_curl_multi_perform_guard_body(VALUE argp) {
+  struct multi_perform_call_args *args = (struct multi_perform_call_args *)argp;
+  args->result = args->func(args->argc, args->argv, args->self);
+  return args->result;
+}
+
+static VALUE ruby_curl_multi_perform_guard_ensure(VALUE self) {
+  ruby_curl_multi *rbcm;
+  TypedData_Get_Struct(self, ruby_curl_multi, &ruby_curl_multi_data_type, rbcm);
+  rbcm->perform_active = 0;
+  rbcm->perform_thread = Qnil;
+  rbcm->callback_active = 0;
+  rbcm->allow_close_during_perform = 0;
+  return Qnil;
+}
+
+static VALUE ruby_curl_multi_with_perform_guard(int argc, VALUE *argv, VALUE self, VALUE (*func)(int, VALUE *, VALUE)) {
+  ruby_curl_multi *rbcm;
+  struct multi_perform_call_args args;
+
+  TypedData_Get_Struct(self, ruby_curl_multi, &ruby_curl_multi_data_type, rbcm);
+  if (rbcm->perform_active) {
+    rb_raise(rb_eRuntimeError, "Cannot recursively perform an active Curl::Multi handle");
+  }
+
+  /* Reopening an autoclosed multi initializes its guard fields. Do this before
+   * claiming ownership so repeated performs retain the full-lifetime guard. */
+  ruby_curl_multi_ensure_handle(rbcm);
+  rbcm->perform_active = 1;
+  rbcm->perform_thread = rb_thread_current();
+  args.argc = argc;
+  args.argv = argv;
+  args.self = self;
+  args.result = Qnil;
+  args.func = func;
+
+  return rb_ensure(ruby_curl_multi_perform_guard_body, (VALUE)&args,
+                   ruby_curl_multi_perform_guard_ensure, self);
+}
+
+VALUE ruby_curl_multi_perform(int argc, VALUE *argv, VALUE self) {
+#if defined(HAVE_CURL_MULTI_SOCKET_ACTION) && defined(HAVE_CURLMOPT_SOCKETFUNCTION) && defined(HAVE_CURLMOPT_TIMERFUNCTION) && defined(HAVE_RB_THREAD_FD_SELECT) && !defined(_WIN32)
+  /*
+   * The legacy fdset loop waits with rb_thread_fd_select, which releases the
+   * GVL but never consults the fiber scheduler, stalling every other fiber on
+   * this thread for the duration of the transfers. When the calling fiber
+   * runs under a fiber scheduler, use the socket-action drive loop, which
+   * waits through the scheduler's io_wait/io_select/kernel_sleep hooks.
+   */
+  if (curb_fiber_scheduler_current() != Qnil) {
+    return ruby_curl_multi_with_perform_guard(argc, argv, self, ruby_curl_multi_socket_perform_impl);
+  }
+#endif
+  return ruby_curl_multi_with_perform_guard(argc, argv, self, ruby_curl_multi_perform_impl);
+}
+
+/*
+ * Name of the kernel event queue the socket-action loop waits on under a
+ * fiber scheduler ("epoll" or "kqueue"), or nil when this build has none.
+ */
+static VALUE ruby_curl_multi_socket_poller(VALUE klass) {
+  (void)klass;
+#ifdef CURB_SOCKET_POLLER
+  return rb_str_new_cstr(CURB_SOCKET_POLLER_NAME);
+#else
+  return Qnil;
+#endif
+}
+
+#if defined(HAVE_CURL_MULTI_SOCKET_ACTION) && defined(HAVE_CURLMOPT_SOCKETFUNCTION) && defined(HAVE_CURLMOPT_TIMERFUNCTION) && defined(HAVE_RB_THREAD_FD_SELECT) && !defined(_WIN32)
+VALUE ruby_curl_multi_socket_perform(int argc, VALUE *argv, VALUE self) {
+  return ruby_curl_multi_with_perform_guard(argc, argv, self, ruby_curl_multi_socket_perform_impl);
+}
+#endif
+
+/* Drive one step under the same ownership guard as #perform so recursive use,
+ * cross-thread access, and close-during-perform are rejected consistently. */
+static VALUE ruby_curl_multi_perform_step(int argc, VALUE *argv, VALUE self) {
+  return ruby_curl_multi_with_perform_guard(argc, argv, self, ruby_curl_multi_perform_step_impl);
 }
 
 /*
@@ -1842,6 +2728,12 @@ static VALUE ruby_curl_multi_perform_step(int argc, VALUE *argv, VALUE self) {
 VALUE ruby_curl_multi_close(VALUE self) {
   ruby_curl_multi *rbcm;
   TypedData_Get_Struct(self, ruby_curl_multi, &ruby_curl_multi_data_type, rbcm);
+
+  ruby_curl_multi_check_thread(rbcm);
+  if ((rbcm->perform_active || rbcm->callback_active) && !rbcm->allow_close_during_perform) {
+    rb_raise(rb_eRuntimeError, "Cannot close an active Curl::Multi handle during perform");
+  }
+
   rb_curl_multi_detach_all(rbcm);
 
   if (rbcm->handle) {
@@ -1875,6 +2767,7 @@ static int mark_attached_i(st_data_t key, st_data_t val, st_data_t arg) {
 static void curl_multi_mark(void *ptr) {
   ruby_curl_multi *rbcm = (ruby_curl_multi *)ptr;
   if (!rbcm) return;
+  rb_gc_mark(rbcm->perform_thread);
   if (rbcm->attached) {
     st_foreach(rbcm->attached, mark_attached_i, (st_data_t)0);
   }
@@ -1884,8 +2777,31 @@ static void curl_multi_mark(void *ptr) {
 /* =================== INIT LIB =====================*/
 void init_curb_multi() {
   idCall = rb_intern("call");
+  cRubyFiber = rb_const_get(rb_cObject, rb_intern("Fiber"));
+  rb_global_variable(&cRubyFiber);
+  cRubyRactor = Qnil;
+  id_ractor_current = rb_intern("current");
+  id_ractor_aref = rb_intern("[]");
+  id_ractor_aset = rb_intern("[]=");
+  id_ractor_default_timeout_key = rb_intern("__curb_multi_default_timeout");
+  id_ractor_autoclose_key = rb_intern("__curb_multi_autoclose");
+  if (rb_const_defined(rb_cObject, rb_intern("Ractor"))) {
+    VALUE ractor = rb_const_get(rb_cObject, rb_intern("Ractor"));
+    VALUE current = rb_funcall(ractor, id_ractor_current, 0);
+    if (rb_respond_to(current, id_ractor_aref) && rb_respond_to(current, id_ractor_aset)) {
+      cRubyRactor = ractor;
+    }
+  }
+  rb_global_variable(&cRubyRactor);
+  id_fiber_blocking_p = rb_intern("blocking?");
+  id_fiber_scheduler = rb_intern("scheduler");
+  id_kernel_sleep = rb_intern("kernel_sleep");
+  id_io_wait = rb_intern("io_wait");
   id_deferred_exception_ivar = rb_intern("@__curb_deferred_exception");
   id_deferred_exception_source_id_ivar = rb_intern("@__curb_deferred_exception_source_id");
+  id_native_safety_signatures_ivar = rb_intern("@__curb_native_safety_signatures");
+  id_socket_io_cache_ivar = rb_intern("@__curb_socket_io_cache");
+  id_socket_poller_io_ivar = rb_intern("@__curb_socket_poller_io");
   cCurlMulti = rb_define_class_under(mCurl, "Multi", rb_cObject);
 
   rb_define_alloc_func(cCurlMulti, ruby_curl_multi_alloc);
@@ -1903,14 +2819,16 @@ void init_curb_multi() {
   rb_define_method(cCurlMulti, "_add", ruby_curl_multi_add, 1);
   rb_define_method(cCurlMulti, "_remove", ruby_curl_multi_remove, 1);
   /*
-   * The legacy fdset loop is the stable default. The newer socket-action path
-   * is kept in-tree, but it has shown scheduler regressions for one-handle
-   * multi usage (for example Curl::Easy#perform under Async).
+   * perform uses the legacy fdset loop by default, but routes to the
+   * socket-action drive loop when the calling fiber runs under a fiber
+   * scheduler so sibling fibers keep running during transfers. The
+   * socket-action path is also exposed directly as _socket_perform.
    */
   rb_define_method(cCurlMulti, "perform", ruby_curl_multi_perform, -1);
 #if defined(HAVE_CURL_MULTI_SOCKET_ACTION) && defined(HAVE_CURLMOPT_SOCKETFUNCTION) && defined(HAVE_CURLMOPT_TIMERFUNCTION) && defined(HAVE_RB_THREAD_FD_SELECT) && !defined(_WIN32)
   rb_define_private_method(cCurlMulti, "_socket_perform", ruby_curl_multi_socket_perform, -1);
 #endif
+  rb_define_private_method(rb_singleton_class(cCurlMulti), "_socket_poller", ruby_curl_multi_socket_poller, 0);
   rb_define_method(cCurlMulti, "_close", ruby_curl_multi_close, 0);
   rb_define_method(cCurlMulti, "fdset", ruby_curl_multi_fdset, 0);
   rb_define_method(cCurlMulti, "perform_step", ruby_curl_multi_perform_step, -1);

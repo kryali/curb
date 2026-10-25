@@ -1,10 +1,9 @@
 # Curb - Libcurl bindings for Ruby
 
-[![CI](https://github.com/taf2/curb/actions/workflows/ci.yml/badge.svg)](https://github.com/taf2/curb/actions/workflows/ci.yml)
-[![codecov](https://codecov.io/gh/taf2/curb/branch/master/graph/badge.svg)](https://codecov.io/gh/taf2/curb)
+[![CI](https://github.com/taf2/curb/actions/workflows/CI.yml/badge.svg)](https://github.com/taf2/curb/actions/workflows/CI.yml)
 [![Gem Version](https://badge.fury.io/rb/curb.svg)](https://badge.fury.io/rb/curb)
 
-* [CI Build Status](https://github.com/taf2/curb/actions/workflows/ci.yml)
+* [CI Build Status](https://github.com/taf2/curb/actions/workflows/CI.yml)
 * [rubydoc rdoc](http://www.rubydoc.info/github/taf2/curb/)
 * [github project](http://github.com/taf2/curb/tree/master)
 
@@ -23,8 +22,8 @@ Ruby license. See the LICENSE file for the gory details.
 
 ## Easy mode
 
-GET request
-```
+### GET request
+```ruby
   res = Curl.get("https://www.google.com/") {|http|
     http.timeout = 10 # raise exception if request/response not handled within 10 seconds
   }
@@ -33,8 +32,8 @@ GET request
   puts res.body
 ```
 
-POST request
-```
+### POST request
+```ruby
   res = Curl.post("https://your-server.com/endpoint", {post: "this"}.to_json) {|http|
     http.headers["Content-Type"] = "application/json"
   }
@@ -45,7 +44,9 @@ POST request
 
 ## FTP Support
 
+```ruby
 require 'curb'
+```
 
 ### Basic FTP Download
 ```ruby
@@ -139,7 +140,7 @@ puts list.body
 ```
 
 ### Advanced FTP Usage with Various Options
-```
+```ruby
 puts "\n=== Advanced FTP Example ==="
 advanced = Curl::Easy.new do |curl|
   curl.url = 'ftp://ftp.example.com/remote/file.txt'
@@ -175,7 +176,7 @@ advanced.perform
 ```
 
 ### Parallel FTP Downloads
-```
+```ruby
 puts "\n=== Parallel FTP Downloads Example ==="
 urls = [
   'ftp://ftp.example.com/file1.txt',
@@ -185,7 +186,7 @@ urls = [
 ```
 
 ### Common options for all connections
-```
+```ruby
 options = {
   :username => 'user',
   :password => 'password',
@@ -199,11 +200,124 @@ Curl::Multi.download(urls, options) do |curl, file_path|
 end
 ```
 
+## Security considerations
+
+`curb` is a libcurl binding and intentionally supports protocols beyond HTTP.
+Do not pass untrusted URLs to `Curl.get`, `Curl::Easy.new`, or related raw
+helpers without application-level validation. For user-supplied URLs, enable the
+safety policy for the current Ractor before making requests. `Curl.safe!` defaults
+to HTTP/HTTPS and `network_policy = :public`, blocking local/private destinations
+even when called without a block. Safe mode also defaults to a 10 MiB
+(10,485,760-byte) response-body limit:
+
+```ruby
+Curl.safe! do |config|
+  config.network_policy = :public      # default; block local/private destination IPs
+  config.max_body_bytes = 1_000_000     # optional tighter cap; default is 10 MiB
+end
+
+curl = Curl.get(user_url)               # allows only http/https, including redirects
+```
+
+To allow a different protocol set, configure it explicitly. Redirects default to
+the same protocol list:
+
+```ruby
+Curl.safe! do |config|
+  config.protocols = [:http, :ftp]
+  config.max_body_bytes = 1_000_000
+end
+```
+
+For local per-handle policy, use `easy.safe_http!` before `perform`, or use
+`Curl.safe_get`, `Curl.safe_post`, and the other `safe_*` helpers. These enforce
+HTTP/HTTPS for requests and redirects and enable `network_policy = :public`,
+even when the global policy permits private destinations. This rejects local
+services as well as private and link-local addresses, including metadata endpoints.
+The proxy and destination-override controls below apply, with any explicit
+exceptions from `Curl.safe!` honored. Unsupported libcurl builds fail closed.
+Safe helpers and `easy.safe_http!` default to the global safe-mode body limit,
+or 10 MiB when global safe mode is not enabled. Override it explicitly with
+`Curl.safe_get(user_url, :max_body_bytes => 1_000_000)` or
+`easy.safe_http!(:max_body_bytes => 20 * 1024 * 1024)`. A tighter global limit
+always takes precedence. Set `config.max_body_bytes = nil` (or `0`) to disable
+the global cap; a helper's explicit `:max_body_bytes => nil` or `0` disables its
+own cap, but cannot bypass a global cap or an existing tighter handle limit.
+Raw requests outside safe mode remain unlimited unless configured otherwise.
+These limits cover body bytes, not response headers.
+For trusted local services, use the raw helpers with explicit protocol limits.
+If global safe mode is enabled, explicitly set `config.network_policy = :none`
+to opt out of peer-address filtering; `safe_*` helpers still enforce `:public`.
+
+With `network_policy = :public`, curb checks peer addresses when libcurl opens
+the socket and blocks local/private destinations. Proxies, `resolve`,
+`connect_to`, DoH URL overrides, and Unix socket paths are disabled by default
+under this policy unless explicitly allowed in the safety config. Custom DNS
+server overrides are rejected. To use a trusted explicit proxy without
+re-enabling environment proxies, set `allowed_proxy_hosts` and configure
+`easy.proxy_url` on the request.
+
+For stricter egress, combine the public network policy with host and CIDR
+allowlists. Host allowlists gate the configured request URL and, when supported
+by libcurl, each followed redirect before the request is sent. CIDR allowlists
+are checked against the resolved peer address at socket-open time:
+
+```ruby
+Curl.safe! do |config|
+  config.network_policy = :public
+  config.allowed_hosts = ["api.example.com"]
+  config.allowed_proxy_hosts = ["proxy.example.com"]
+  config.allowed_cidrs = ["93.184.216.0/24", "2606:2800:220::/48"]
+end
+```
+
+By default, responses are buffered into `body` when no `on_body` callback is
+configured. For untrusted or large responses, use `on_body`, `download`, and/or
+`max_body_bytes` so a remote endpoint cannot force unbounded memory growth.
+`max_body_bytes` is enforced for downloads as well as buffered responses and
+custom body callbacks.
+
+## Ractor support
+
+On Ruby 3.0+, curb can perform requests from multiple Ractors when it is built
+against a libcurl that reports the `CURL_VERSION_THREADSAFE` capability
+(libcurl 7.84.0 or newer). Check `Curl::RACTOR_SAFE` at runtime. Builds that do
+not meet those requirements continue to work in the main Ractor but do not
+advertise native Ractor safety.
+
+Create `Curl::Easy` and `Curl::Multi` handles inside the Ractor that uses them;
+do not operate on the same native handle concurrently from different Ractors.
+Safety configuration, `Curl::Multi.default_timeout`, `Curl::Multi.autoclose`,
+and deferred cleanup queues are isolated per Ractor. Call `Curl.safe!` in each
+Ractor that needs the safety policy:
+
+```ruby
+raise "this curb build is not Ractor-safe" unless Curl::RACTOR_SAFE
+
+workers = 4.times.map do
+  Ractor.new do
+    Curl.safe! { |config| config.protocols = [:http, :https] }
+    easy = Curl::Easy.new("https://example.com/")
+    easy.perform
+    easy.response_code
+  end
+end
+
+# Ruby 4.0 uses Ractor#value; earlier Ractor releases use Ractor#take.
+statuses = workers.map do |worker|
+  worker.respond_to?(:value) ? worker.value : worker.take
+end
+```
+
+Curb enables `CURLOPT_NOSIGNAL` on newly initialized and reset Easy handles by
+default so separate handles can be used safely from parallel Ruby execution.
+Applications can still override the option explicitly when required.
+
 ## You will need
 
 * A working Ruby installation (`2.0.0+` will work but `2.1+` preferred) (it's possible it still works with 1.8.7 but you'd have to tell me if not...)
 * A working libcurl development installation
-(Ideally one of the versions listed in the compatibility chart below that maps to your `curb` version)
+  (Ideally one of the versions listed in the compatibility chart below that maps to your `curb` version)
 * A sane build environment (e.g. gcc, make)
 
 ## Version Compatibility chart
@@ -212,8 +326,28 @@ A **non-exhaustive** set of compatibility versions of the libcurl library
 with this gem are as follows. (Note that these are only the ones that have been
 tested and reported to work across a variety of platforms / rubies)
 
+The upper bounds for recent releases reflect the compatibility work documented
+in the changelog, including the libcurl 8.16.0 regression workaround in 1.2.2
+and the libcurl 8.20.0 scheduler fixes in 1.3.5. The 1.3.7 upper bound also
+includes expected compatibility with libcurl 8.21.0; this version is not yet
+an explicit CI target.
+
 | Gem Version | Release Date   | libcurl versions  |
 | ----------- | -------------- | ----------------- |
+| 1.4.0       | Sep 27, 2026   | 7.58 – 8.21.0     |
+| 1.3.7       | Jul 10, 2026   | 7.58 – 8.21.0     |
+| 1.3.6       | Jun 17, 2026   | 7.58 – 8.20.0     |
+| 1.3.5       | May 14, 2026   | 7.58 – 8.20.0     |
+| 1.3.4       | May 12, 2026   | 7.58 – 8.16.0     |
+| 1.3.3       | May 11, 2026   | 7.58 – 8.16.0     |
+| 1.3.2       | Apr 23, 2026   | 7.58 – 8.16.0     |
+| 1.3.1       | Apr 05, 2026   | 7.58 – 8.16.0     |
+| 1.3.0       | Apr 02, 2026   | 7.58 – 8.16.0     |
+| 1.2.2       | Sep 18, 2025   | 7.58 – 8.16.0     |
+| 1.2.1       | Sep 17, 2025   | 7.58 – 8.12.1     |
+| 1.2.0       | Aug 31, 2025   | 7.58 – 8.12.1     |
+| 1.1.0       | Jul 24, 2025   | 7.58 – 8.12.1     |
+| 1.0.9       | Feb 15, 2025   | 7.58 – 8.12.1     |
 | 1.0.8       | Feb 10, 2025   | 7.58 – 8.12.1     |
 | 1.0.7       | Feb 09, 2025   | 7.58 – 8.12.1     |
 | 1.0.6       | Aug 23, 2024   | 7.58 – 8.12.1     |
@@ -230,7 +364,7 @@ tested and reported to work across a variety of platforms / rubies)
 | 0.9.4       | Aug 2017       | 7.41 – 7.58       |
 | 0.9.3       | Apr 2016       | 7.26 – 7.58       |
 
-  ```*avoid using these version are known to have issues with segmentation faults```
+*Avoid using these versions; they are known to have issues with segmentation faults.*
 
 ## Installation...
 
@@ -400,6 +534,7 @@ c = Curl::Easy.http_post("http://my.rails.box/thing/create",
 c = Curl::Easy.new("http://my.rails.box/files/upload")
 c.multipart_form_post = true
 c.http_post(Curl::PostField.file('thing[file]', 'myfile.rb'))
+```
 
 ### Custom request target
 
@@ -413,7 +548,6 @@ c.perform
 ```
 
 For HTTPS, prefer `easy.resolve = ["host:443:IP"]` to keep Host/SNI/certificates aligned.
-```
 
 ### Using HTTP/2
 

@@ -133,6 +133,79 @@ class TestCurbCurlMulti < Test::Unit::TestCase
     Curl::Multi.autoclose = false
   end
 
+  def test_close_inside_completion_callback_is_rejected_without_invalidating_multi
+    multi = Curl::Multi.new
+    easy = Curl::Easy.new(TestServlet.url)
+
+    easy.on_complete { multi.close }
+    multi.add(easy)
+
+    error = assert_raise(Curl::Err::AbortedByCallbackError) { multi.perform }
+    assert_match(/Cannot close an active Curl::Multi handle/, error.message)
+    assert multi.idle?
+    assert_equal({}, multi.requests)
+
+    easy.on_complete { |_curl| }
+    multi.add(easy)
+    multi.perform
+
+    assert_equal "GET", easy.body_str
+  ensure
+    multi.close if defined?(multi) && multi
+  end
+
+  def test_close_inside_perform_block_is_rejected_without_invalidating_multi
+    multi = Curl::Multi.new
+    easy = Curl::Easy.new(TestServlet.url)
+    multi.add(easy)
+
+    error = assert_raise(RuntimeError) do
+      multi.perform { multi.close }
+    end
+    assert_match(/Cannot close an active Curl::Multi handle/, error.message)
+
+    assert_nothing_raised { multi.close }
+    multi = nil
+  ensure
+    multi.close if defined?(multi) && multi
+  end
+
+  def test_active_easy_cannot_be_added_to_another_multi
+    first_multi = Curl::Multi.new
+    second_multi = Curl::Multi.new
+    easy = Curl::Easy.new(TestServlet.url)
+
+    first_multi.add(easy)
+
+    error = assert_raise(RuntimeError) { second_multi.add(easy) }
+    assert_match(/active Curl::Easy/, error.message)
+    assert_same first_multi, easy.multi
+    assert_equal easy, first_multi.requests[easy.object_id]
+
+    assert_nothing_raised { first_multi.close }
+    first_multi = nil
+  ensure
+    first_multi.close if defined?(first_multi) && first_multi
+    second_multi.close if defined?(second_multi) && second_multi
+  end
+
+  def test_easy_multi_assignment_detaches_from_old_multi
+    multi = Curl::Multi.new
+    easy = Curl::Easy.new(TestServlet.url)
+
+    multi.add(easy)
+    easy.multi = nil
+
+    assert_nil easy.multi
+    assert_equal({}, multi.requests)
+    assert_nothing_raised { easy.close }
+    assert_nothing_raised { multi.close }
+
+    multi = nil
+  ensure
+    multi.close if defined?(multi) && multi
+  end
+
   def test_close_makes_multi_unusable
     multi = Curl::Multi.new
     multi.close
@@ -191,6 +264,41 @@ class TestCurbCurlMulti < Test::Unit::TestCase
     assert_match(/^# DO NOT REMOVE THIS COMMENT/, c2.body_str)
   ensure
     m.close if m
+  end
+
+  def test_multi_perform_runs_work_added_from_final_idle_yield
+    with_queue_refill_test_server do |port, hits|
+      previous_autoclose = Curl::Multi.autoclose
+      Curl::Multi.autoclose = true
+
+      multi = Curl::Multi.new
+      slow = Curl::Easy.new("http://127.0.0.1:#{port}/slow")
+      queued = Curl::Easy.new("http://127.0.0.1:#{port}/queued")
+      completions = []
+      empty_yields = 0
+      queued_added = false
+
+      slow.on_complete { completions << :slow }
+      queued.on_complete { completions << :queued }
+
+      multi.add(slow)
+      multi.perform do |performing_multi|
+        empty_yields += 1 if performing_multi.requests.empty?
+        if !queued_added && empty_yields >= 2
+          queued_added = true
+          performing_multi.add(queued)
+        end
+      end
+
+      assert queued_added, "test should add queued work from the final idle yield"
+      assert_equal [:slow, :queued], completions
+      assert_equal 1, hits[:slow]
+      assert_equal 1, hits[:queued]
+      assert_equal 0, multi.requests.length
+    ensure
+      Curl::Multi.autoclose = previous_autoclose if defined?(previous_autoclose)
+      multi.close if defined?(multi) && multi
+    end
   end
 
   def test_multi_easy_get
@@ -478,6 +586,35 @@ class TestCurbCurlMulti < Test::Unit::TestCase
     end
   end
 
+  # Only easies attached by the raising callback itself are withdrawn. Work
+  # queued by an earlier, successful callback in the same perform was already
+  # attached when the failing callback started, so it keeps running and the
+  # deferred exception is raised once it drains.
+  def test_multi_perform_keeps_work_added_by_earlier_callback_when_later_callback_raises
+    server = CurbTinyHTTPServer.new
+    multi = Curl::Multi.new
+    first = Curl::Easy.new(server.url('/fast'))
+    failing = Curl::Easy.new(server.url('/delay/0.15'))
+    kept = Curl::Easy.new(server.url('/delay/0.4'))
+
+    first.on_complete { multi.add(kept) }
+    failing.on_complete { raise "complete blew up" }
+
+    error = assert_raise(Curl::Err::AbortedByCallbackError) do
+      multi.add(first)
+      multi.add(failing)
+      multi.perform
+    end
+
+    assert_equal "complete blew up", error.message
+    assert_equal 0, kept.last_result
+    assert_equal "delayed", kept.body_str,
+                 "work added by an earlier successful callback should finish, not be withdrawn with the failing callback's additions"
+  ensure
+    multi.close if multi
+    server.close if server
+  end
+
   def test_multi_perform_does_not_start_work_added_within_on_complete_after_on_body_exception
     with_queue_refill_test_server do |port, hits|
       multi = Curl::Multi.new
@@ -661,6 +798,23 @@ class TestCurbCurlMulti < Test::Unit::TestCase
     m.close if m
   end
 
+  def test_native_safety_signatures_are_pruned_after_perform
+    m = Curl::Multi.new
+    easy = Curl::Easy.new($TEST_URL)
+
+    m.add(easy)
+    signatures = m.__send__(:__curb_native_safety_signatures)
+    assert_equal easy, m.requests[easy.object_id]
+    assert signatures.key?(easy.object_id)
+
+    m.perform
+
+    assert_equal 0, m.requests.length
+    assert_empty signatures
+  ensure
+    m.close if m
+  end
+
   def test_easy_multi_is_cleared_after_perform
     m = Curl::Multi.new
     c = Curl::Easy.new($TEST_URL)
@@ -673,6 +827,21 @@ class TestCurbCurlMulti < Test::Unit::TestCase
     assert_nil c.multi
   ensure
     m.close if m
+  end
+
+  def test_frozen_idle_easy_multi_reference_is_cleared_on_close
+    multi = Curl::Multi.new
+    easy = Curl::Easy.new($TEST_URL)
+    easy.freeze
+
+    easy.multi = multi
+
+    assert_same multi, easy.multi
+    assert_nothing_raised { multi.close }
+    assert_nil easy.multi
+    multi = nil
+  ensure
+    multi.close if multi
   end
 
   def test_easy_multi_is_available_during_completion_callbacks
@@ -897,6 +1066,193 @@ class TestCurbCurlMulti < Test::Unit::TestCase
         assert File.exist?(download_path)
         assert_equal file_info[File.basename(download_path)][:size], File.size(download_path), "incomplete download: #{download_path}"
       end
+    end
+  end
+
+  def test_multi_download_refuses_existing_explicit_download_path
+    root_uri = 'http://127.0.0.1:9129/ext/'
+
+    Dir.mktmpdir('curb-download-') do |download_dir|
+      download_path = File.join(download_dir, 'curb_easy.c')
+      File.write(download_path, 'sentinel')
+
+      assert_raise(Curl::DownloadTargetExistsError) do
+        Curl::Multi.download([root_uri + 'curb_easy.c'], {}, {}, [download_path])
+      end
+
+      assert_equal 'sentinel', File.read(download_path)
+    end
+  end
+
+  def test_multi_download_failed_transfer_does_not_publish_file_without_block
+    Dir.mktmpdir('curb-download-') do |download_dir|
+      download_path = File.join(download_dir, 'missing')
+
+      error = assert_raise(Curl::Multi::DownloadError) do
+        Curl::Multi.download(['file:///curb/missing'], {}, {}, [download_path])
+      end
+
+      assert !error.errors.empty?
+      assert !File.exist?(download_path)
+    end
+  end
+
+  def test_multi_download_failed_transfer_does_not_publish_file_or_call_block
+    called = false
+
+    Dir.mktmpdir('curb-download-') do |download_dir|
+      download_path = File.join(download_dir, 'missing')
+
+      error = assert_raise(Curl::Multi::DownloadError) do
+        Curl::Multi.download(['file:///curb/missing'], {}, {}, [download_path]) do |_curl, _path|
+          called = true
+        end
+      end
+
+      assert !error.errors.empty?
+      assert_equal false, called
+      assert !File.exist?(download_path)
+    end
+  end
+
+  def test_multi_download_failed_transfer_closes_io_destination
+    Dir.mktmpdir('curb-download-') do |download_dir|
+      download_path = File.join(download_dir, 'missing')
+      io = File.open(download_path, 'wb')
+
+      error = assert_raise(Curl::Multi::DownloadError) do
+        Curl::Multi.download(['file:///curb/missing'], {}, {}, [io])
+      end
+
+      assert !error.errors.any? { |e| e.is_a?(ArgumentError) }
+      assert io.closed?
+      assert_equal '', File.read(download_path)
+    end
+  end
+
+  def test_multi_download_preserves_body_limit_callback_error
+    with_raw_http_response("HTTP/1.1 200 OK\r\nContent-Length: 64\r\n\r\n#{'x' * 64}") do |url|
+      Dir.mktmpdir('curb-download-') do |download_dir|
+        download_path = File.join(download_dir, 'too-large')
+
+        error = assert_raise(Curl::Err::FileSizeExceededError) do
+          Curl::Multi.download([url], { :max_body_bytes => 10 }, {}, [download_path])
+        end
+
+        assert_match(/Maximum body size exceeded/, error.message)
+        assert !File.exist?(download_path)
+      end
+    end
+  end
+
+  def test_multi_download_preserves_output_write_callback_error
+    writer_error = Class.new(StandardError)
+
+    with_raw_http_response("HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\ndata") do |url|
+      Dir.mktmpdir('curb-download-') do |download_dir|
+        writer = File.open(File.join(download_dir, 'writer'), 'wb')
+        writer.define_singleton_method(:write) do |_data|
+          raise writer_error, 'writer failed'
+        end
+
+        error = assert_raise(writer_error) do
+          Curl::Multi.download([url], {}, {}, [writer])
+        end
+
+        assert_equal 'writer failed', error.message
+        assert writer.closed?
+      end
+    end
+  end
+
+  def test_multi_download_safe_directory_rejects_unsafe_names
+    root_uri = 'http://127.0.0.1:9129/ext/'
+
+    Dir.mktmpdir('curb-download-') do |download_dir|
+      ['../escape.c', '.env', 'nested/file', '/tmp/escape.c', "bad\0name"].each do |name|
+        assert_raise(ArgumentError, "expected #{name.inspect} to be rejected") do
+          Curl::Multi.download([root_uri + 'curb_easy.c'], {}, {}, [name], :download_dir => download_dir)
+        end
+      end
+    end
+  end
+
+  def test_multi_download_rejects_duplicate_destinations
+    root_uri = 'http://127.0.0.1:9129/ext/'
+
+    Dir.mktmpdir('curb-download-') do |download_dir|
+      assert_raise(ArgumentError) do
+        Curl::Multi.download(
+          [root_uri + 'curb_easy.c?one=1', root_uri + 'curb_easy.c?two=2'],
+          {},
+          {},
+          nil,
+          :download_dir => download_dir
+        )
+      end
+
+      assert !File.exist?(File.join(download_dir, 'curb_easy.c'))
+      assert_equal [], Dir[File.join(download_dir, '.curb-download-*')]
+    end
+  end
+
+  def test_multi_download_safe_directory_strips_query_from_url_basename
+    root_uri = 'http://127.0.0.1:9129/ext/'
+
+    Dir.mktmpdir('curb-download-') do |download_dir|
+      Curl::Multi.download([root_uri + 'curb_easy.c?cache=1'], {}, {}, nil, :download_dir => download_dir)
+
+      download_path = File.join(download_dir, 'curb_easy.c')
+      assert File.exist?(download_path)
+      assert !File.exist?(File.join(download_dir, 'curb_easy.c?cache=1'))
+      assert_equal File.read(File.join(File.dirname(__FILE__), '..','ext','curb_easy.c')), File.read(download_path)
+    end
+  end
+
+  def test_multi_download_hash_url_config_uses_hash_url
+    root_uri = 'http://127.0.0.1:9129/ext/'
+
+    Dir.mktmpdir('curb-download-') do |download_dir|
+      download_path = File.join(download_dir, 'curb_easy.c')
+
+      Curl::Multi.download([{ :url => root_uri + 'curb_easy.c', :method => :get }], {}, {}, [download_path]) do |curl, path|
+        assert_equal 200, curl.response_code
+        assert_equal download_path, path
+      end
+
+      assert_equal File.read(File.join(File.dirname(__FILE__), '..','ext','curb_easy.c')), File.read(download_path)
+    end
+  end
+
+  def test_multi_download_duplicate_urls_use_distinct_explicit_paths
+    url = "file://#{File.expand_path(File.join(File.dirname(__FILE__), '..','ext','curb_easy.c'))}"
+
+    Dir.mktmpdir('curb-download-') do |download_dir|
+      paths = [
+        File.join(download_dir, 'a.c'),
+        File.join(download_dir, 'b.c')
+      ]
+      completed_paths = []
+
+      Curl::Multi.download([url, url], {}, {}, paths) do |_curl, path|
+        completed_paths << path
+      end
+
+      assert_equal paths.sort, completed_paths.sort
+      assert_equal File.read(paths[0]), File.read(paths[1])
+    end
+  end
+
+  def test_multi_download_accepts_indexed_hash_download_paths
+    root_uri = 'http://127.0.0.1:9129/ext/'
+
+    Dir.mktmpdir('curb-download-') do |download_dir|
+      download_path = File.join(download_dir, 'curb_easy.c')
+
+      Curl::Multi.download([root_uri + 'curb_easy.c'], {}, {}, {0 => download_path})
+
+      assert File.exist?(download_path)
+      assert_equal File.read(File.join(File.dirname(__FILE__), '..','ext','curb_easy.c')), File.read(download_path)
     end
   end
 
@@ -1233,6 +1589,28 @@ class TestCurbCurlMulti < Test::Unit::TestCase
     server.shutdown if defined?(server) && server
     server_thread.join(server_startup_timeout) if defined?(server_thread) && server_thread
     server_thread.kill if defined?(server_thread) && server_thread&.alive?
+  end
+
+  def with_raw_http_response(response)
+    server = TCPServer.new('127.0.0.1', 0)
+    port = server.addr[1]
+    thread = Thread.new do
+      socket = server.accept
+      begin
+        socket.readpartial(4096)
+      rescue EOFError
+      end
+      socket.write(response)
+      socket.close
+    end
+
+    yield "http://127.0.0.1:#{port}/"
+  ensure
+    server.close if defined?(server) && server && !server.closed?
+    if defined?(thread) && thread
+      thread.join(5)
+      thread.kill if thread.alive?
+    end
   end
 
   include TestServerMethods

@@ -270,6 +270,7 @@ have_constant "curl_version_idn"
 have_constant "curl_version_sspi"
 have_constant "curl_version_conv"
 have_constant "curl_version_http2"
+have_constant "curl_version_threadsafe"
 have_constant "curlproxy_http"
 have_constant "curlproxy_socks4"
 have_constant "curlproxy_socks4a"
@@ -308,6 +309,8 @@ have_constant "curlopt_sockoptfunction"
 have_constant "curlopt_sockoptdata"
 have_constant "curlopt_opensocketfunction"
 have_constant "curlopt_opensocketdata"
+have_constant "curlopt_prereqfunction"
+have_constant "curlopt_prereqdata"
 
 # Deprecated constants (still check for them for backward compat)
 have_constant "curlopt_ioctlfunction"
@@ -401,6 +404,7 @@ have_constant "curlopt_socks5_gssapi_nec"
 have_constant "curlopt_interface"
 have_constant "curlopt_localport"
 have_constant "curlopt_dns_cache_timeout"
+have_constant "curlopt_dns_servers"
 have_constant "curlopt_dns_use_global_cache"
 have_constant "curlopt_buffersize"
 have_constant "curlopt_port"
@@ -469,6 +473,9 @@ have_constant "curlopt_ftp_use_eprt"
 have_constant "curlopt_ftp_use_epsv"
 have_constant "curlopt_ftp_use_pret"
 have_constant "curlopt_ftp_create_missing_dirs"
+have_constant "curlftp_create_dir_none"
+have_constant "curlftp_create_dir"
+have_constant "curlftp_create_dir_retry"
 have_constant "curlopt_ftp_response_timeout"
 have_constant "curlopt_ftp_alternative_to_user"
 have_constant "curlopt_ftp_skip_pasv_ip"
@@ -541,6 +548,7 @@ have_constant "curlusessl_none"
 have_constant "curlusessl_try"
 have_constant "curlusessl_control"
 have_constant "curlusessl_all"
+have_constant "curlopt_connect_to"
 have_constant "curlopt_resolve"
 have_constant "curlopt_request_target"
 have_constant "curlopt_sslcert"
@@ -568,6 +576,10 @@ have_constant :CURL_SSLVERSION_TLSv1_2
 have_constant :CURL_SSLVERSION_TLSv1_3
 
 have_constant "curlopt_ssl_verifypeer"
+have_constant "curlopt_doh_url"
+have_constant "curlopt_doh_ssl_verifypeer"
+have_constant "curlopt_doh_ssl_verifyhost"
+have_constant "curlopt_doh_ssl_verifystatus"
 have_constant "curlopt_cainfo"
 have_constant "curlopt_issuercert"
 have_constant "curlopt_capath"
@@ -701,6 +713,9 @@ have_func('rb_wait_for_single_fd', 'ruby/io.h')
 have_header('ruby/fiber/scheduler.h')
 have_func('rb_fiber_scheduler_current', 'ruby/fiber/scheduler.h')
 have_func('rb_fiber_scheduler_io_wait', 'ruby/fiber/scheduler.h')
+have_func('rb_fiber_scheduler_io_select', 'ruby/fiber/scheduler.h')
+have_func('rb_fiber_scheduler_kernel_sleep', 'ruby/fiber/scheduler.h')
+have_func('rb_ext_ractor_safe')
 have_func('rb_io_stdio_file')
 have_func('curl_multi_wait')
 have_func('curl_multi_socket_action')
@@ -711,6 +726,10 @@ have_func('curl_multi_socket')
 have_func('curl_multi_timer_callback')
 have_constant 'curlmopt_socketfunction'
 have_constant 'curlmopt_timerfunction'
+# Kernel event queues let the socket-action loop wait on one descriptor for
+# every libcurl socket under a fiber scheduler.
+have_header('sys/epoll.h') && have_func('epoll_create1', 'sys/epoll.h')
+have_header('sys/event.h') && have_func('kqueue', ['sys/types.h', 'sys/event.h'])
 have_func('curl_easy_duphandle')
 
 # Optional: enable verbose socket-action debug logging.
